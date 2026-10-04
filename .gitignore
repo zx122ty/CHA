@@ -1,0 +1,41 @@
+# folder
+writing/
+存档/
+构造browseTable/
+herb_category_analysis/
+memory/
+cache/
+
+# pipeline run outputs (regenerable)
+output*/
+sirius_input/
+sirius_project/
+
+# files
+CLAUDE.md
+*.log
+MEMORY.md
+data_orig.qs
+*bak*
+*.csv
+README_old.md
+
+# data / cache files (regenerable)
+*.qs
+*.rds
+*.RData
+*.sqlite
+
+# R artifacts
+.Rhistory
+.Renviron
+.Rproj.user/
+Rplots.pdf
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local settings
+.claude/settings.local.json

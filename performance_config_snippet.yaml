@@ -1,0 +1,33 @@
+# ── Performance & Concurrency Settings ──────────────────────────────────
+# Controls parallelization, I/O engine, caching, and memory management
+# across the entire pipeline.
+performance:
+  # Parallel backend
+  cores: 4                          # Number of parallel workers (0 = auto-detect)
+  parallel_backend: "multisession"  # "multisession" (fork+PSOCK), "multicore" (fork),
+                                    # "sequential" (disable parallel)
+  parallel_setup_timeout: 30        # Seconds to wait for backend initialization
+
+  # High-performance I/O
+  io_engine: "data.table"           # "data.table" (fread/fwrite) or "base" (read.csv/write.csv)
+  serialize_engine: "qs"            # "qs" (fastest, default), "fst", or "rds" (legacy)
+  qs_preset: "high"                 # qs compression preset: "fast", "high", "custom", "none"
+                                    # "fast" = 2× faster than rds, "high" = 4× compression
+
+  # Caching system
+  enable_caching: true              # Master toggle for all caching
+  cache_dir: "cache"                # Relative to project working_dir
+  cache_max_age_days: 30            # Auto-evict cache entries older than this
+  hash_algorithm: "md5"             # "md5" (fast) or "sha256" (secure)
+
+  # Memory management
+  aggressive_gc: true               # Insert explicit gc() calls after large steps
+  gc_frequency: "after_each_step"   # "after_each_step", "after_large_steps", "never"
+  max_ms2_spectra_mb: 500           # Warn if MS2 spectra exceed this threshold
+
+  # External tool threading
+  sirius_threads: 4                 # Passed as --threads to SIRIUS CLI
+  metfrag_threads: 2                # Reserved for future MetFrag CLI multi-threading
+
+  # SQLite cache for network/API calls (MetaboAnalystR, KEGG)
+  sqlite_cache: true                # Cache KEGG/MetaboAnalystR API responses locally

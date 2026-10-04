@@ -1,0 +1,64 @@
+# Concentration-response analysis configuration
+# All thresholds are assumptions from prompt/下游分析/concentration_response_plan.md §1.2
+# (A1-A6, user-confirmed 2026-09-27) — adjust here, never in code.
+
+paths:
+  project_root: /home/data/shareData/16tdisk/Project/161-metabo-rawdata
+  browse_table: code/metadata/Browse_Table_v2.csv
+  results_dir: results
+  cck8_dir: results/cck8_analysis            # upstream module outputs (steps 0-1 of that module)
+  integration_dir: results/cross_batch_integration/web_export
+  output_dir_rel: results/concentration_analysis
+
+# --- Dose definition (A1, A5: extensible to >=3 levels) ------------------------
+# dose_levels: ordered list. Each entry: name (label), mg_ml (assumed conc),
+# cck8_cols (replicate columns in cck8_normalized.csv), ms_dose (logFC suffix).
+doses:
+  - {name: Low,  mg_ml: 0.2, cck8_cols: [低浓度-1, 低浓度-2], ms_dose: Low}
+  - {name: High, mg_ml: 1.0, cck8_cols: [高浓度-1, 高浓度-2], ms_dose: High}
+
+cck8:
+  # input files (from the cck8_analysis module; do not re-read the xlsx here)
+  normalized_csv: data/cck8_normalized.csv
+  toxicity_class_csv: data/toxicity_class.csv
+  rep_discordance: 0.20          # QC flag, same as cck8 module
+
+# --- Q1 phenotype response-shape classification --------------------------------
+phenotype:
+  z_cut: 2.0                     # |standardized slope| below this = flat (A5: descriptive)
+  effect_cut: 0.10               # viability effect vs control considered "present"
+  linear_ratio_min: 0.6          # hi/lo effect-magnitude window for linear class
+  linear_ratio_max: 2.0          #   (both doses effective, roughly proportional increase)
+  saturating_factor: 1.2         # hi_eff < lo_eff * factor => no further response at high dose
+  proliferative_threshold: 1.10  # A3: counted as active
+
+# --- Q2/Q3 metabolic gradient ----------------------------------------------------
+metabolic:
+  quantile_low: 0.25             # metab_insensitive cutoff (P25 of per-herb magnitude)
+  quantile_high: 0.75            # metab_sensitive cutoff (P75)
+  min_abs_rho: 0.30              # Q2 association cutoff (pooled test)
+  fdr_cutoff: 0.10               # pooled-test FDR (per-group n is small; see plan §2.4)
+  volcano_fdr_cutoff: 0.05       # per-herb volcano FDR for the overlap robustness check (plan §2.4)
+  direction_consistency_min: 0.60
+  bootstrap_n: 1000
+  seed: 42
+
+# --- Q4 pathway level -------------------------------------------------------------
+pathway:
+  kegg_link_cache: cache/kegg_link_pathway_cpd.tsv   # relative to this file's dir
+  kegg_name_cache: cache/kegg_list_pathway.txt       # pathway id -> name
+  min_groups_per_pathway: 3
+  fdr_cutoff: 0.05
+  min_abs_rho: 0.25
+
+# --- Q5 DRI ------------------------------------------------------------------------
+dri:
+  z_cap: 4.0                     # truncate |z_viab| before scaling to [0,1]
+  weight_pheno: 0.5
+  weight_meto: 0.5
+  meto_p95: true                 # scale metab magnitude by its P95
+
+integration:
+  batches: [1, 2, 3, 5, 6]       # batch 4 excluded (QC gate; A4)
+  mz_ppm: 12                     # must match cross_batch_integration run
+  rt_tol: 20

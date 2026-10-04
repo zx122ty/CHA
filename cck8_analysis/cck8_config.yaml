@@ -1,0 +1,42 @@
+# CCK8 x metabolomics analysis configuration
+# All thresholds are assumptions from prompt/下游分析/CCK8_analysis_plan.md §3
+# (Q1-Q8) — adjust here, never in code.
+
+paths:
+  project_root: /home/data/shareData/16tdisk/Project/161-metabo-rawdata
+  cck8_xlsx: 大批量cck8实验_v3.xlsx
+  browse_table: code/metadata/Browse_Table_v2.csv
+  file_lists_dir: code/metadata          # mzml_file_list_Batch{N}_convert.csv
+  results_dir: results
+  integration_dir: results/cross_batch_integration/web_export
+  output_dir_rel: results/cck8_analysis
+
+cck8:
+  low_cols: [低浓度-1, 低浓度-2]
+  high_cols: [高浓度-1, 高浓度-2]
+  # Assumed concentrations (Q1 — unconfirmed; matches metabolomics protocol_v3)
+  assumed_low_conc_mg_ml: 0.2
+  assumed_high_conc_mg_ml: 1.0
+
+classification:
+  toxic_threshold: 0.90        # Q6 default
+  sensitivity_thresholds: [0.85, 0.90, 0.95]
+  proliferative_threshold: 1.10   # Q5: separate class, excluded from contrasts
+  extreme_low: 0.40            # QC flag
+  extreme_high: 1.25           # QC flag
+  rep_discordance: 0.20        # QC flag (Q4: no plate layout available)
+
+linkage:
+  fdr_cutoff: 0.05
+  min_abs_rho: 0.30            # Step 3 association cutoff
+  bootstrap_n: 1000
+  seed: 42
+  # two-group contrast (Step 3b): toxic vs neutral, Wilcoxon on group logFC
+
+integration:
+  batches: [1, 2, 3, 5, 6]     # batch 4 excluded (QC gate)
+  mz_ppm: 12                   # must match cross_batch_integration run
+  rt_tol: 20
+
+web:
+  include_raw_values: true

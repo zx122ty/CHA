@@ -1,0 +1,47 @@
+# ── MetaboAnalystR Advanced Analysis (optional) ──────────────────────────
+# Requires MetaboAnalystR package installed:
+#   install.packages("MetaboAnalystR", repos = c("https://cran.r-project.org", "https://bioconductor.org"))
+# This module implements four advanced downstream analyses:
+#   1. MSEA (Metabolite Set Enrichment Analysis) — uses all-feature limma
+#      statistics (t-statistics or log2FC) for QSEA/GlobalTest
+#   2. Pathway Topology Analysis — KEGG topology with Relative Betweenness
+#      Centrality or Impact Centrality
+#   3. Biomarker Analysis — Random Forest feature selection + ROC curves
+#   4. Chemical Class Enrichment — HMDB Super Class/ClassyFire taxonomy
+#      enrichment via hypergeometric or global-test
+metaboanalyst_advanced:
+  enabled: false                     # Master toggle for the entire module
+  msea:
+    enabled: true                    # Metabolite Set Enrichment Analysis
+    method: "globaltest"             # "globaltest" (QSEA) or "ora" (over-rep.)
+    # "globaltest" uses all-feature continuous statistics, more powerful
+    # than ORA which only uses significant features
+    stat_type: "tstat"               # "tstat" (limma moderated t) or "log2fc"
+    # Rank metabolite sets by median t-statistic across set members
+    pathway_db: "kegg"               # "kegg" or "smpdb" or "pathbank"
+    n_top_sets: 20                   # Number of top enriched sets to plot
+  pathway_topology:
+    enabled: true
+    metric: "rbc"                    # "rbc" (Rel. Betweenness Centrality)
+                                     # or "impact" (Impact Centrality)
+    pathway_db: "kegg"               # Must match MSEA's db for consistency
+    combine_queries: true            # Combine MSEA p-values with topology
+                                     # scores for unified ranking
+  biomarker:
+    enabled: true
+    # Random Forest biomarker discovery
+    rf_ntree: 500                    # Number of trees in RF
+    rf_mtry: null                    # mtry per split (null = sqrt(p))
+    rf_importance: "accuracy"        # "accuracy" or "gini" for var importance
+    n_top_features: 20               # Top N features to evaluate via ROC
+    # ROC curve analysis
+    roc_threshold: 0.7               # Min AUC to report biomarker candidates
+    roc_ci_method: "delong"          # "delong" or "bootstrap" for AUC CI
+    roc_n_bootstrap: 2000            # Bootstrap replicates if CI=bootstrap
+  chem_class_enrichment:
+    enabled: true
+    taxon_level: "super_class"       # "super_class", "class", "sub_class"
+    # Uses HMDB or ClassyFire taxonomy annotations from the annotation table
+    method: "fisher"                 # "fisher" (exact test) or "globaltest"
+    p_cutoff: 0.05                   # Significance threshold for enrichment
+    p_adjust_method: "fdr"           # "fdr", "bonferroni", "BH"
