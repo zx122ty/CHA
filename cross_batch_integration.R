@@ -79,6 +79,16 @@ readj <- function(f) {
   tryCatch(fromJSON(f, simplifyVector = FALSE), error = function(e) NULL)
 }
 
+# Per-batch feature list for alignment. features.json (pipeline >= 2026-10-09)
+# holds every feature; metabolites.json only the annotated ones (it held ~96% of
+# features before the annotation fix, so older exports still align).
+read_batch_features <- function(web) {
+  f <- readj(file.path(web, "features.json"))
+  if (!is.null(f) && !is.null(f$features)) return(f$features)
+  m <- readj(file.path(web, "metabolites.json"))
+  if (is.null(m)) NULL else m$metabolites
+}
+
 # -----------------------------------------------------------------------------
 # Stage 1 helpers: locate + read per-batch inputs
 # -----------------------------------------------------------------------------
@@ -464,7 +474,7 @@ main <- function() {
     out_root <- if (!is.null(b$output_dir)) b$output_dir else dirname(web)
     cmp_meta <- man$treatments
 
-    raw_feats <- features_of(readj(file.path(web, "metabolites.json"))$metabolites, bid)
+    raw_feats <- features_of(read_batch_features(web), bid)
     diffs <- load_batch_diffs(web)
     for (cmp in names(diffs)) diffs[[cmp]]$batch_id <- as.integer(bid)
 

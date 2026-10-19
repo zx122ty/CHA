@@ -469,6 +469,15 @@ config <- list(
     rsd_threshold       = 30.0,
     min_intensity       = 1000.0
   ),
+  # One ion eluting in two waves (phospholipids re-elute ~25-31 s later at one
+  # fixed RT) -> summed into one feature; see merge_split_peaks()
+  split_peaks = list(
+    enabled      = TRUE,
+    mz_ppm       = 10,
+    min_cor      = 0.7,
+    min_codetect = 0.5,
+    gap_window   = 6
+  ),
   normalization = list(
     qc_min_samples  = 3,
     svr_threads     = 4,
@@ -512,9 +521,15 @@ config <- list(
     min_comparisons_per_metabolite = 2
   ),
   kegg = list(
-    # tidymass enrich_hmdb runs against the HMDB/SMPDB collection; the
-    # "kegg" folder name is legacy. Filter on BH-adjusted q-values.
-    q_value_cutoff             = 0.05
+    # Step 7 runs mummichog (MetaboAnalystR) on all features against the
+    # organism's KEGG pathways — no compound IDs needed. mmu = mouse (the cells
+    # are mouse primary cells). Pathways are reported at BH q < q_value_cutoff.
+    # The same library supplies the KEGG part of the endogenous naming set.
+    organism                   = "mmu",
+    q_value_cutoff             = 0.05,
+    mummichog_ppm              = 10,
+    mummichog_permutations     = 1000,
+    mummichog_min_significant  = 10
   ),
   metaboanalyst_advanced = list(
     # Requires the MetaboAnalystR package (installed here: 4.2.0).
@@ -540,7 +555,9 @@ config <- list(
     )
   ),
   annotation = list(
-    column           = "rp",
+    # ACQUITY BEH Amide (HILIC), 15 mM ammonium acetate + 0.3% ammonia, ESI-.
+    # metid's adduct tables depend on it: "hilic" uses acetate, "rp" fluoride.
+    column           = "hilic",
     ms1_db_dir      = if (!is.null(opt$`ms1-db-dir`)) opt$`ms1-db-dir` else "/home/data/shareData/16tdisk/Project/tidymass2/database/MS1_Database",
     ms2_db_dir      = if (!is.null(opt$`ms2-db-dir`)) opt$`ms2-db-dir` else "/home/data/shareData/16tdisk/Project/tidymass2/database/MS2_Compound_database",
     inhouse_db_path = "/home/data/shareData/16tdisk/Project/tidymass2/database/MS1_Database/inhouse_Metabolite.database",
@@ -559,10 +576,33 @@ config <- list(
     rt_match_weight  = 0.25,
     ms2_match_weight = 0.5,
     total_score_tol  = 0.35,
-    candidate_num    = 3,
-    db_priority     = list("MS2_HMDB", "MS2_GNPS", "MS2_GNPS_IH",
-                           "MS2_GNPS_NIH", "MS2_MassBank", "MS2_MoNA",
-                           "HMDB", "KEGG", "ChEBI", "FooDB", "PubChem")
+    candidate_num    = 3,     # per MS2 library (metid)
+    max_candidates   = 5,     # per feature after pooling all sources
+    # MS2 spectral libraries. GNPS_NIH (NIH Clinical Collection) is left out:
+    # it has no negative-mode spectra, so metid fell back to MS1-only matching
+    # against a drug library. Libraries without spectra for the acquisition
+    # polarity are skipped automatically.
+    ms2_databases   = list("MS2_HMDB", "MS2_GNPS", "MS2_GNPS_IH",
+                           "MS2_MassBank", "MS2_MoNA"),
+    # Accurate-mass (MS1) candidates come only from an endogenous naming set:
+    # HMDB quantified/detected entries with a cellular location, plus the
+    # KEGG metabolic-pathway compounds of kegg$organism. ChEBI, FooDB, PubChem
+    # and HMDB expected/predicted entries are not searched: against all ~490k
+    # compounds, decoy m/z values matched as often as real ones.
+    ms1_naming_sources = list("HMDB", "KEGG"),
+    hmdb_status        = list("quantified", "detected"),
+    hmdb_require_cellular_location = TRUE,
+    # In preference order; ESI- with an acetate buffer. Water loss and
+    # chloride were matched mostly by chance on Batch1 (decoy/real 0.87, 0.74).
+    ms1_adducts     = if (polarity == "positive") {
+      list("(M+H)+", "(M+H-H2O)+", "(M+NH4)+", "(M+Na)+")
+    } else {
+      list("(M-H)-", "(M+CH3COO)-")
+    },
+    # Tie-break between sources of the same evidence tier (MS2 library hits
+    # always rank above accurate-mass candidates).
+    db_priority     = list("MS2_HMDB", "MS2_GNPS", "MS2_GNPS_IH", "MS2_MassBank",
+                           "MS2_MoNA", "HMDB", "KEGG_mmu")
   ),
   # ── CAMERA: Adduct & isotope grouping ──────────────────────────────────
   camera = list(
@@ -598,6 +638,11 @@ config <- list(
     # stall for hours. See sirius_available_databases() in the pipeline: the
     # requested list is filtered against what is actually installed.
     structure_db  = "HMDB,CHEBI",
+    # A CSI:FingerID top hit names a feature (MSI Level 2) only at COSMIC
+    # confidence >= this value; below it the feature keeps formula + CANOPUS
+    # class (Level 3). COSMIC scores are not probabilities (SIRIUS FAQ); most
+    # hits here score ~0.1 and are implausible structures.
+    min_structure_confidence = 0.5,
     # SIRIUS skips already-computed results, so changing structure_db alone has
     # no effect. Set true for one run to force the search to be redone.
     recompute_structure = FALSE,

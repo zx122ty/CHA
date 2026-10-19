@@ -87,7 +87,7 @@ main <- function() {
       sprintf("- **active_metabolism_only** (metabolically active, phenotype-flat) = pharmacologically active candidates: %d herbs.",
               sum(disc$quadrant == "active_metabolism_only")), "",
       "## Q4 — Pathway level (exploratory)", "",
-      sprintf("- %d KEGG pathways tested; sig_dose_dep: %d; sig_toxic_contrast: %d (KEGG coverage ~13%% of groups).",
+      sprintf("- %d KEGG pathways tested; sig_dose_dep: %d; sig_toxic_contrast: %d (KEGG IDs only for MSI Level 1-2 identified features).",
               nrow(pw), sum(pw$sig_dose_dep), sum(pw$sig_toxic_contrast)), "",
       "## Q5 — DRI (website)", "",
       sprintf("- DRI = %.1f·|z_viab capped at %.0f| + %.1f·(metab magnitude / P95); exported to `web_export/concentration.json` (%d herbs).",

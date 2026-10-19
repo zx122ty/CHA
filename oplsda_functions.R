@@ -711,6 +711,21 @@ update_oplsda_with_annotation <- function(oplsda_dir,
   # 检测是否有 MSI 置信度列
   has_confidence <- "confidence_level" %in% colnames(app3)
 
+  # 每个 feature 一行（app3 是多候选长表，直接 join 会让 VIP 表重复行）。
+  # Compound.name / HMDB.ID / KEGG.ID 只给已鉴定（Level 1-2）的 feature；
+  # 仅精确质量候选（Level 3）放在 putative_name，图上用 display_name。
+  feat_annot <- app3 %>%
+    dplyr::distinct(variable_id, .keep_all = TRUE)
+  if ("identified_name" %in% colnames(feat_annot)) {
+    feat_annot <- feat_annot %>%
+      dplyr::mutate(Compound.name = identified_name,
+                    HMDB.ID = identified_hmdb_id,
+                    KEGG.ID = identified_kegg_id)
+  }
+  if (!"display_name" %in% colnames(feat_annot)) {
+    feat_annot$display_name <- feat_annot$Compound.name
+  }
+
   all_vip_annotated <- list()
 
   for (rds_file in rds_files) {
@@ -727,21 +742,18 @@ update_oplsda_with_annotation <- function(oplsda_dir,
     # ── 合并注释（含置信度等级）──
     fi <- model$feature_importance
     # 动态选择要 join 的列
-    join_cols <- c("variable_id", "Compound.name", "HMDB.ID", "KEGG.ID")
+    join_cols <- c("variable_id", "Compound.name", "HMDB.ID", "KEGG.ID",
+                   "putative_name", "display_name")
     if (has_confidence) {
       join_cols <- c(join_cols, "confidence_level")
     }
     fi_annotated <- fi %>%
       dplyr::left_join(
-        app3 %>% dplyr::select(dplyr::any_of(join_cols)),
+        feat_annot %>% dplyr::select(dplyr::any_of(join_cols)),
         by = "variable_id"
       ) %>%
       dplyr::mutate(
-        label_name = dplyr::if_else(
-          !is.na(Compound.name) & Compound.name != "",
-          Compound.name,
-          variable_id
-        )
+        label_name = dplyr::if_else(!is.na(display_name), display_name, variable_id)
       )
 
     # ── 保存注释版 Feature Importance Table ──
@@ -751,15 +763,16 @@ update_oplsda_with_annotation <- function(oplsda_dir,
     fi_annotated$comparison <- cmp_name
     all_vip_annotated[[cmp_name]] <- fi_annotated
 
-    n_annotated <- sum(!is.na(fi_annotated$Compound.name) & fi_annotated$Compound.name != "")
+    n_annotated <- sum(!is.na(fi_annotated$confidence_level) &
+                         grepl("Level [123]", fi_annotated$confidence_level))
     n_confident <- if (has_confidence) {
       sum(!is.na(fi_annotated$confidence_level) &
             grepl("Level [12]", fi_annotated$confidence_level))
     } else 0
-    cat(sprintf("    Feature Importance: %s / %s 已注释",
+    cat(sprintf("    Feature Importance: %s / %s 有注释（Level 1-3）",
                 n_annotated, nrow(fi_annotated)))
     if (has_confidence && n_confident > 0) {
-      cat(sprintf("（其中 %d 个为 Level 1-2 高置信度）", n_confident))
+      cat(sprintf("（其中 %d 个为 Level 1-2 已鉴定）", n_confident))
     }
     cat("\n")
 
@@ -767,21 +780,17 @@ update_oplsda_with_annotation <- function(oplsda_dir,
     if (!is.null(model$splot_data) && nrow(model$splot_data) > 0) {
       s_df <- model$splot_data
       # 合并注释和置信度
-      splot_join_cols <- c("variable_id", "Compound.name")
+      splot_join_cols <- c("variable_id", "display_name")
       if (has_confidence) {
         splot_join_cols <- c(splot_join_cols, "confidence_level")
       }
       s_df <- s_df %>%
         dplyr::left_join(
-          app3 %>% dplyr::select(dplyr::any_of(splot_join_cols)),
+          feat_annot %>% dplyr::select(dplyr::any_of(splot_join_cols)),
           by = "variable_id"
         ) %>%
         dplyr::mutate(
-          label_name = dplyr::if_else(
-            !is.na(Compound.name) & Compound.name != "",
-            Compound.name,
-            variable_id
-          )
+          label_name = dplyr::if_else(!is.na(display_name), display_name, variable_id)
         )
 
       # 筛选 Top VIP（VIP > threshold 且按 VIP 降序取前 15 个有注释的）
@@ -791,18 +800,13 @@ update_oplsda_with_annotation <- function(oplsda_dir,
         dplyr::slice_head(n = 15)
 
       if (nrow(top_label) > 0) {
-        # 显示化合物名 + 置信度等级（如果可用）
+        # 显示名 + 置信度等级（display_name 已含 Level 3 的 "?" 与 feature ID）
         top_label <- top_label %>%
           dplyr::mutate(
             display_label = dplyr::case_when(
-              !is.na(Compound.name) & Compound.name != "" & has_confidence &
-                !is.na(confidence_level) ~ {
-                  # Shorten confidence level for display
-                  cl_short <- gsub("Level (\\d).*", "L\\1", confidence_level)
-                  paste0(Compound.name, " [", cl_short, "]")
-                },
-              !is.na(Compound.name) & Compound.name != "" ~
-                paste0(Compound.name, " (", variable_id, ")"),
+              !is.na(display_name) & has_confidence & !is.na(confidence_level) ~
+                paste0(display_name, " [", gsub("Level (\\d).*", "L\\1", confidence_level), "]"),
+              !is.na(display_name) ~ display_name,
               TRUE ~ variable_id
             )
           )
@@ -874,9 +878,11 @@ update_oplsda_with_annotation <- function(oplsda_dir,
   if (length(all_vip_annotated) > 0) {
     vip_annot_summary <- dplyr::bind_rows(all_vip_annotated)
     # reorder columns: comparison first, then key annotation columns
-    reorder_cols <- c("comparison", "variable_id",
-                      "Compound.name", if (has_confidence) "confidence_level" else NULL,
+    reorder_cols <- c("comparison", "variable_id", "display_name",
+                      "Compound.name", "putative_name",
+                      if (has_confidence) "confidence_level" else NULL,
                       "VIP", "p1", "pcorr1")
+    reorder_cols <- intersect(reorder_cols, colnames(vip_annot_summary))
     reorder_cols <- reorder_cols[!sapply(reorder_cols, is.null)]
     other_cols <- setdiff(colnames(vip_annot_summary), reorder_cols)
     vip_annot_summary <- vip_annot_summary[, c(reorder_cols, other_cols)]

@@ -20,6 +20,10 @@
 #   Rscript run_all_batches.R --integration-only        # Only cross-batch integration
 #   Rscript run_all_batches.R --dry-run                 # Show what would be done
 #   Rscript run_all_batches.R --validate-only           # Validate configs only
+#   Rscript run_all_batches.R --reuse-oplsda --qualitative-only 4
+#                                                       # Re-run annotation onward, keep OPLS-DA models
+#   Rscript run_all_batches.R --reuse-oplsda --reuse-pathways --qualitative-only 4
+#                                                       # ... and keep the mummichog results too
 #
 # Dependencies:
 #   - All pipeline dependencies (see metabolomics_pipeline.R)
@@ -137,7 +141,19 @@ parse_cli <- function() {
     make_option(c("--oplsda-permutations"), dest = "oplsda_permutations",
                 type = "integer", default = NULL,
                 help = "OPLS-DA permutation count passed to make_config.R (default 1000; use 100 for a quick pilot batch)",
-                metavar = "INT")
+                metavar = "INT"),
+    make_option(c("--reuse-oplsda"), dest = "reuse_oplsda",
+                action = "store_true", default = FALSE,
+                help = paste("Pass --reuse-oplsda to each pipeline run: keep the saved",
+                             "OPLS-DA models and re-run everything else (annotation onward)")),
+    make_option(c("--cores"), type = "integer", default = NULL,
+                help = paste("Workers per batch (make_config.R --cores; default all cores).",
+                             "Each idle multisession worker holds ~1.3 GB, so 19 workers",
+                             "need ~25 GB for the whole run"), metavar = "INT"),
+    make_option(c("--reuse-pathways"), dest = "reuse_pathways",
+                action = "store_true", default = FALSE,
+                help = paste("Pass --reuse-pathways to each pipeline run: keep the",
+                             "mummichog results in 07_KEGG (valid when only the annotation changed)"))
   )
 
   opt <- parse_args(OptionParser(
@@ -318,6 +334,9 @@ run_batch <- function(batch_id, cfg, opts) {
     config_args <- c(config_args,
                      "--oplsda-permutations", as.character(opts$oplsda_permutations))
   }
+  if (!is.null(opts$cores)) {
+    config_args <- c(config_args, "--cores", as.character(opts$cores))
+  }
 
   success <- run_cmd("Rscript", config_args,
                      log_file = gsub("\\.log$", "_config.log", log_file),
@@ -359,6 +378,12 @@ run_batch <- function(batch_id, cfg, opts) {
   if (batch_id %in% (opts$qualitative_only_ids %||% integer(0))) {
     pipeline_args <- c(pipeline_args, "--qualitative-only")
     log_msg(sprintf("  Batch %d: qualitative-only mode (no quantitative steps)", batch_id))
+  }
+  if (isTRUE(opts$reuse_oplsda)) {
+    pipeline_args <- c(pipeline_args, "--reuse-oplsda")
+  }
+  if (isTRUE(opts$reuse_pathways)) {
+    pipeline_args <- c(pipeline_args, "--reuse-pathways")
   }
   success <- run_cmd("Rscript", pipeline_args,
                      log_file = log_file,

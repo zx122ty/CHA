@@ -5,6 +5,7 @@ writing/
 herb_category_analysis/
 memory/
 cache/
+metabolites_annotation/
 
 # pipeline run outputs (regenerable)
 output*/
@@ -31,6 +32,10 @@ README_old.md
 .Renviron
 .Rproj.user/
 Rplots.pdf
+
+# Python artifacts
+__pycache__/
+*.pyc
 
 # OS junk
 .DS_Store

@@ -4,7 +4,8 @@
 # group -> KEGG compound (all member features, mz/RT window) -> pathway
 # (cached KEGGREST bulk table). Per pathway: pooled Spearman of the per-herb
 # pathway gradient vs z_viab + toxic_high-vs-neutral Wilcoxon on the gradient.
-# Exploratory: only ~13% of groups carry a KEGG compound ID (plan §2.6).
+# Exploratory: only MSI Level 1-2 identified features carry a KEGG compound ID
+# (a few dozen groups since the 2026-10-09 annotation fix), so few pathways qualify.
 # Writes data/pathway_dose_response.csv, figures/pathway_dose_response_*.
 ###############################################################################
 suppressPackageStartupMessages({ library(ggplot2); library(dplyr) })
@@ -53,9 +54,9 @@ main <- function() {
   feats_list <- list()
   for (bid in cfg$integration$batches) {
     web <- file.path(cfg$paths$results_dir, paste0("Batch", bid), "detail", "web_export")
-    m <- readj(file.path(web, "metabolites.json"))
+    m <- read_batch_features(web)
     if (is.null(m)) next
-    f <- features_of(m$metabolites, bid)
+    f <- features_of(m, bid)
     if (!is.null(f) && nrow(f) > 0) feats_list[[as.character(bid)]] <- f
   }
   combined <- do.call(rbind, feats_list)
@@ -137,7 +138,7 @@ main <- function() {
   # --- report ------------------------------------------------------------------------------
   lines <- c(
     "# Q4 - Dose-Dependent Pathway Rewiring (KEGG)", "",
-    sprintf("_Generated: %s_  (EXPLORATORY: KEGG compound coverage ~13%% of groups)", fmt_time()), "",
+    sprintf("_Generated: %s_  (EXPLORATORY: KEGG compound IDs only for MSI Level 1-2 identified features)", fmt_time()), "",
     "Per pathway: mean per-herb gradient z over its mapped groups; pooled Spearman vs z_viab;",
     "plus toxic_high-vs-neutral Wilcoxon on the same gradient. BH-FDR across all pathways.", "",
     sprintf("- Pathways tested: **%d** (min %d mapped groups); sig_dose_dep (FDR<%.2f, |rho|>=%.2f): **%d**; sig_toxic_contrast: **%d**",

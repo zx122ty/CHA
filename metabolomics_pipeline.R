@@ -166,38 +166,22 @@ assess_quantification_quality <- function(qc_quality,
   list(valid = length(reasons) == 0, reasons = reasons)
 }
 
-#' Assign MSI confidence level based on available evidence
+#' MSI confidence level labels (Metabolomics Standards Initiative)
 #'
-#' Follows the Metabolomics Standards Initiative (MSI) guidelines:
-#'   Level 1 — Confirmed:      MS2 + RT match against in-house database
-#'   Level 2 — Putatively identified: MS2 spectral match against external database
-#'   Level 3 — Putatively annotated:  MS1 accurate mass match only
-#'   Level 4 — Unknown:        no match in any database
-#'
-#' @param has_ms2_match Logical, whether the feature has an MS2 spectral match
-#' @param has_ms1_match Logical, whether the feature has an MS1 mass match
-#' @param has_rt_match  Logical, whether RT was matched (reserved for future use)
-#' @param is_inhouse    Logical, whether the match is from an in-house database
-#' @param is_sirius     Logical, whether SIRIUS provided formula/structure evidence
-#' @param is_metfrag    Logical, whether MetFrag validated the fragmentation
-#' @return Character string with MSI confidence level
-assign_confidence_level <- function(has_ms2_match, has_ms1_match,
-                                     has_rt_match = FALSE, is_inhouse = FALSE,
-                                     is_sirius = FALSE, is_metfrag = FALSE) {
-  if (has_ms2_match && has_rt_match && is_inhouse) {
-    return("Level 1 — Confirmed")
-  } else if (is_metfrag && has_ms2_match) {
-    return("Level 1 — Confirmed")
-  } else if (has_ms2_match) {
-    return("Level 2 — Putatively identified")
-  } else if (is_sirius) {
-    return("Level 2 — Putatively identified")
-  } else if (has_ms1_match) {
-    return("Level 3 — Putatively annotated")
-  } else {
-    return("Level 4 — Unknown")
-  }
-}
+#'   Level 1 — Confirmed:              MS2 + RT match against an authentic standard
+#'                                     (or MetFrag-validated MS2 match)
+#'   Level 2 — Putatively identified:  MS2 spectral-library match, or a SIRIUS
+#'                                     CSI:FingerID structure above the confidence cutoff
+#'   Level 3 — Putatively annotated:   accurate-mass candidate from the endogenous
+#'                                     naming set, or a SIRIUS/CANOPUS class only
+#'   Level 4 — Unknown:                no candidate
+#' See finalize_annotation() for how a feature's level is decided.
+MSI_LEVELS <- c(
+  L1 = "Level 1 — Confirmed",
+  L2 = "Level 2 — Putatively identified",
+  L3 = "Level 3 — Putatively annotated",
+  L4 = "Level 4 — Unknown"
+)
 
 #' Save a ggplot object as both PDF and PNG
 #'
@@ -229,12 +213,23 @@ parse_cli <- function() {
                 help = paste("Skip every intensity-dependent step and keep only",
                              "analyses valid on a degraded batch (annotation +",
                              "QC diagnostic PCA). For batches whose QC-RSD makes",
-                             "quantification unreliable."))
+                             "quantification unreliable.")),
+    make_option(c("--reuse-oplsda"), dest = "reuse_oplsda",
+                action = "store_true", default = FALSE,
+                help = paste("Skip Step 3.5 when 03.5_OPLSDA already holds the",
+                             "saved models (the permutations dominate run time);",
+                             "use to re-run annotation and later steps.")),
+    make_option(c("--reuse-pathways"), dest = "reuse_pathways",
+                action = "store_true", default = FALSE,
+                help = paste("Skip Step 7 when 07_KEGG already holds mummichog",
+                             "results. mummichog reads only m/z, RT and p-values,",
+                             "so an annotation-only change does not alter them."))
   )
   opt <- parse_args(OptionParser(
     option_list = option_list,
     usage = paste("Rscript metabolomics_pipeline.R --config <FILE>",
-                  "[--validate-only] [--qualitative-only]")
+                  "[--validate-only] [--qualitative-only] [--reuse-oplsda]",
+                  "[--reuse-pathways]")
   ))
   if (is.null(opt$config)) {
     stop("--config is required. Use --help for usage.")
@@ -744,6 +739,134 @@ extract_and_remove_internal_standards <- function(expression_data, variable_info
   )
 }
 
+#' Merge features that are one ion eluting in two waves
+#'
+#' On this LC system each phospholipid class elutes at its own RT (PE/PC
+#' ~60-66 s, PI ~64-72 s) and then all classes re-elute together in a second
+#' wave at one fixed RT (~97 s; ~88 s in Batch1). Both waves are present in
+#' every sample, so the same ion becomes two features a batch-specific gap
+#' apart (24-31 s) whose intensities correlate (r ~ 0.8). Such pairs are
+#' summed into one feature that keeps the earlier, class-specific RT, so the
+#' same lipid still aligns across batches. The gap is estimated per batch from
+#' strongly linked pairs (r >= 0.8, co-detected in >= 80% of the samples where
+#' either is detected); a pair is merged when it is within gap +/- gap_window,
+#' r >= min_cor and co-detected in >= min_codetect. Isomers at other RT
+#' differences, or uncorrelated ones, stay separate.
+#'
+#' @param expression_data Feature x sample intensities (NA = not detected)
+#' @param variable_info data.frame with variable_id, mz, rt (same row order)
+#' @param cfg Validated config list (block `split_peaks`)
+#' @return list(expression_data, variable_info, merges); variable_info gains
+#'   `split_members` ("id1;id2") on merged features
+merge_split_peaks <- function(expression_data, variable_info, cfg) {
+  sp <- cfg$split_peaks
+  if (is.null(sp)) sp <- list()     # %||% here is scalar-only
+  unchanged <- list(expression_data = expression_data, variable_info = variable_info,
+                    merges = NULL)
+  if (isFALSE(sp$enabled)) return(unchanged)
+  cat("\n----- Step 2-pre: Split-peak merge (same ion in two elution waves) -----\n")
+  ppm          <- as.numeric(sp$mz_ppm %||% 10)
+  min_cor      <- as.numeric(sp$min_cor %||% 0.7)
+  min_codetect <- as.numeric(sp$min_codetect %||% 0.5)
+  gap_window   <- as.numeric(sp$gap_window %||% 6)
+
+  X <- as.matrix(expression_data)
+  X[!is.finite(X) | X <= 0] <- NA
+  det <- !is.na(X)
+  L <- log2(X)
+  mz <- variable_info$mz
+  rt <- variable_info$rt
+
+  # same-m/z candidate pairs 8-60 s apart
+  o <- order(mz)
+  cand <- list()
+  for (a in seq_along(o)) {
+    i <- o[a]
+    b <- a + 1L
+    while (b <= length(o) && mz[o[b]] - mz[i] <= mz[i] * ppm / 1e6) {
+      j <- o[b]
+      drt <- abs(rt[j] - rt[i])
+      if (drt >= 8 && drt <= 60) cand[[length(cand) + 1L]] <- c(i, j, drt)
+      b <- b + 1L
+    }
+  }
+  if (length(cand) == 0) {
+    cat("   No same-m/z feature pairs 8-60 s apart\n")
+    return(unchanged)
+  }
+  cand <- do.call(rbind, cand)
+  pair_stats <- t(apply(cand, 1, function(p) {
+    both <- det[p[1], ] & det[p[2], ]
+    either <- det[p[1], ] | det[p[2], ]
+    r <- if (sum(both) >= 10) suppressWarnings(stats::cor(L[p[1], both], L[p[2], both])) else NA_real_
+    c(r, sum(both) / max(1, sum(either)))
+  }))
+  pairs <- data.frame(i = as.integer(cand[, 1]), j = as.integer(cand[, 2]), drt = cand[, 3],
+                      r = pair_stats[, 1], codetect = pair_stats[, 2])
+
+  strong <- pairs[!is.na(pairs$r) & pairs$r >= 0.8 & pairs$codetect >= 0.8, , drop = FALSE]
+  if (nrow(strong) < 10) {
+    cat(sprintf("   Only %d strongly correlated same-m/z pairs; no second elution wave, nothing merged\n",
+                nrow(strong)))
+    return(unchanged)
+  }
+  gap <- stats::median(strong$drt)
+  link <- pairs[!is.na(pairs$r) & pairs$r >= min_cor & pairs$codetect >= min_codetect &
+                  abs(pairs$drt - gap) <= gap_window, , drop = FALSE]
+
+  # connected components (a three-wave train links through its middle peak)
+  parent <- seq_len(nrow(X))
+  find_root <- function(x) {
+    while (parent[x] != x) x <- parent[x]
+    x
+  }
+  for (k in seq_len(nrow(link))) {
+    ri <- find_root(link$i[k]); rj <- find_root(link$j[k])
+    if (ri != rj) parent[max(ri, rj)] <- min(ri, rj)
+  }
+  roots <- vapply(seq_len(nrow(X)), find_root, integer(1))
+  groups <- split(seq_len(nrow(X)), roots)
+  groups <- groups[lengths(groups) > 1]
+
+  merged_vals <- as.matrix(expression_data)
+  drop_rows <- integer(0)
+  variable_info$split_members <- NA_character_
+  merge_rows <- vector("list", length(groups))
+  for (g in seq_along(groups)) {
+    members <- groups[[g]][order(rt[groups[[g]]])]
+    rep_row <- members[1]                       # earlier, class-specific RT
+    summed <- colSums(X[members, , drop = FALSE], na.rm = TRUE)
+    summed[colSums(det[members, , drop = FALSE]) == 0] <- NA
+    merged_vals[rep_row, ] <- summed
+    variable_info$split_members[rep_row] <- paste(variable_info$variable_id[members], collapse = ";")
+    drop_rows <- c(drop_rows, members[-1])
+    merge_rows[[g]] <- data.frame(
+      variable_id = variable_info$variable_id[rep_row],
+      members = variable_info$split_members[rep_row],
+      mz = mz[rep_row],
+      rts = paste(sprintf("%.1f", rt[members]), collapse = ";"),
+      median_intensities = paste(sprintf("%.3g", apply(X[members, , drop = FALSE], 1, stats::median, na.rm = TRUE)),
+                                 collapse = ";"),
+      stringsAsFactors = FALSE)
+  }
+  keep <- setdiff(seq_len(nrow(X)), drop_rows)
+  expression_data[] <- merged_vals
+  merges <- do.call(rbind, merge_rows)
+  cat(sprintf("   Wave gap %.1f s (median of %d strongly correlated same-m/z pairs)\n",
+              gap, nrow(strong)))
+  cat(sprintf("   Merged %d features into %d (%d removed); %d of them m/z > 600\n",
+              sum(lengths(groups)), length(groups), length(drop_rows), sum(merges$mz > 600)))
+
+  out_dir <- file.path(cfg$project$output_dir, "02_Preprocessing")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  merges$wave_gap_s <- round(gap, 1)
+  write.csv(merges, file.path(out_dir, "split_peak_merges.csv"), row.names = FALSE)
+
+  list(expression_data = expression_data[keep, , drop = FALSE],
+       variable_info = variable_info[keep, , drop = FALSE],
+       merges = merges)
+}
+
 #' Read the acquisition start timestamp from an mzML file header.
 #'
 #' `<run startTimeStamp="...">` sits ~18 KB into the file, so a bounded read is
@@ -823,6 +946,11 @@ run_preprocessing <- function(cfg, meta_list, sample_info_all,
   expression_data <- is_result$expression_data
   variable_info   <- is_result$variable_info
   is_qc_stats     <- is_result$is_qc_stats
+
+  # ── 2-pre: one ion eluting in two waves -> one feature ───────────────────
+  split_result    <- merge_split_peaks(expression_data, variable_info, cfg)
+  expression_data <- split_result$expression_data
+  variable_info   <- split_result$variable_info
 
   # ── Determine group membership per sample ────────────────────────────────
   col_map <- meta_list$col_map
@@ -927,6 +1055,10 @@ run_preprocessing <- function(cfg, meta_list, sample_info_all,
 
   cat(sprintf("   Blank samples: %d, Biological samples: %d\n",
               length(blank_samples), length(bio_samples)))
+  if (!is.null(qc_quality)) {
+    qc_quality$n_blank_samples <- length(blank_samples)
+    qc_quality$blank_filter_applied <- length(blank_samples) >= 2
+  }
 
   if (length(blank_samples) >= 2) {
     # Per-feature blank level uses the MEDIAN across blanks (not the mean): it is
@@ -946,7 +1078,15 @@ run_preprocessing <- function(cfg, meta_list, sample_info_all,
     expression_data <- expression_data[blank_pass, , drop = FALSE]
     variable_info   <- variable_info[blank_pass, , drop = FALSE]
   } else {
-    cat("   Insufficient blank samples, skipping blank filter\n")
+    # No process blank in the metadata means solvent/plastic/salt background
+    # ions (TFA, PEG, plasticiser and salt clusters) stay in the feature table
+    # and enter every downstream analysis. KB*.d blank runs exist in the raw
+    # data of Batches 3-6 ("其他文件（调谐、KB、WASH）"; KB*.mzML for 5 and 6) but
+    # are not listed in the metadata CSVs.
+    cat(sprintf("   ⚠️  %d blank sample(s) in the metadata — blank filter NOT applied;\n",
+                length(blank_samples)))
+    cat("      background ions are kept. Add blank runs (group '",
+        blank_name, "') to the metadata and re-extract to enable it.\n", sep = "")
   }
 
   # ── 2b: Missing value filter ─────────────────────────────────────────────
@@ -1576,273 +1716,1043 @@ run_overlap_analysis <- function(diff_results, cfg) {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. Step 6: Enhanced Annotation (multi-database MS1/MS2 + MSI confidence)
+# 8. Step 6: Annotation (MS2 spectral libraries + endogenous accurate mass)
 # ══════════════════════════════════════════════════════════════════════════════
 
-#' Run comprehensive metabolite annotation against MS1 and MS2 databases
+#' Config list/vector value with a default (`%||%` is scalar-only)
+cfg_values <- function(x, default) {
+  if (is.null(x) || length(x) == 0) default else unlist(x, use.names = FALSE)
+}
+
+#' Strip HTML markup that some libraries (ChEBI, GNPS) put in compound names
+strip_html <- function(x) {
+  x <- gsub("<[^>]+>", "", as.character(x))
+  x <- trimws(x)
+  x[!is.na(x) & !nzchar(x)] <- NA_character_
+  x
+}
+
+#' Monoisotopic mass of a neutral molecular formula
 #'
-#' Loads all available databases (MS1 accurate-mass and MS2 spectral libraries),
-#' annotates features, merges by priority, and assigns MSI confidence levels.
-#' Extended with GNPS sub-libraries (IH, NIH) and MoNA for broader coverage.
+#' Prices plain formulas such as "C9H12N2O6". Returns NA for anything it cannot
+#' price exactly: R-groups, polymers ("n"), salts/hydrates ("."), charges,
+#' isotope labels and elements outside the table.
 #'
-#' @param object2 mass_dataset object with MS2 spectra loaded
+#' @param formula Character vector of molecular formulas
+#' @return Numeric vector of monoisotopic masses (Da)
+formula_monoisotopic_mass <- function(formula) {
+  mono <- c(C = 12, H = 1.00782503207, N = 14.0030740048, O = 15.99491461956,
+            P = 30.97376163, S = 31.97207100, F = 18.99840322, Cl = 34.96885268,
+            Br = 78.9183371, I = 126.904473, Na = 22.9897692809, K = 38.96370668,
+            Si = 27.9769265325, Se = 79.9165213, As = 74.9215965, B = 11.0093054,
+            Fe = 55.9349375, Co = 58.933195, Mg = 23.985041700, Ca = 39.96259098,
+            Zn = 63.9291422, Cu = 62.9295975, Mn = 54.9380451, Li = 7.01600455)
+  vapply(as.character(formula), function(f) {
+    if (is.na(f) || !grepl("^([A-Z][a-z]?[0-9]*)+$", f)) return(NA_real_)
+    tokens <- regmatches(f, gregexpr("[A-Z][a-z]?[0-9]*", f))[[1]]
+    element <- sub("[0-9]+$", "", tokens)
+    if (!all(element %in% names(mono))) return(NA_real_)
+    count <- suppressWarnings(as.numeric(sub("^[A-Za-z]+", "", tokens)))
+    count[is.na(count)] <- 1
+    sum(mono[element] * count)
+  }, numeric(1), USE.NAMES = FALSE)
+}
+
+#' Median ppm error between a database mass column and its formulas
+#'
+#' The tidymass HMDB converter (massdatabase::convert_hmdb2metid) stores HMDB's
+#' *average* molecular weight in `mz` — median +676 ppm off — which turned every
+#' HMDB accurate-mass match into a chance hit. Checked on up to `n_check`
+#' priceable rows; NA when no formula can be priced.
+db_mass_error_ppm <- function(mass, formula, n_check = 5000) {
+  mass <- suppressWarnings(as.numeric(mass))
+  formula <- as.character(formula)
+  idx <- which(!is.na(mass) & !is.na(formula) & nzchar(formula))
+  if (length(idx) == 0) return(NA_real_)
+  if (length(idx) > n_check) {
+    idx <- idx[unique(round(seq(1, length(idx), length.out = n_check)))]
+  }
+  theo <- formula_monoisotopic_mass(formula[idx])
+  ok <- !is.na(theo) & theo > 0
+  if (!any(ok)) return(NA_real_)
+  median(abs(mass[idx][ok] - theo[ok]) / theo[ok] * 1e6)
+}
+
+#' Adduct definitions for accurate-mass matching
+#'
+#' Ion m/z = n_mol * M + shift (electron mass included). The default negative-
+#' mode set follows the chromatography — BEH Amide HILIC with 15 mM ammonium
+#' acetate: deprotonation and acetate attachment. The metid rp.neg table used
+#' before also tried Na/K/NH4 exchange ions, fluoride and dimers on every
+#' compound, multiplying the chance-hit rate; water loss and chloride, tested
+#' on Batch1, were matched mostly by chance (decoy/real 0.87 and 0.74, vs 0.36
+#' for [M-H]-).
+#'
+#' @param adducts Character vector of adduct names, in preference order
+#' @return data.frame(adduct, n_mol, shift) in the given order
+adduct_definitions <- function(adducts) {
+  known <- data.frame(
+    adduct = c("(M-H)-", "(M-H2O-H)-", "(M+CH3COO)-", "(M+HCOO)-", "(M+Cl)-",
+               "(M+Na-2H)-", "(M+K-2H)-", "(M+F)-", "(2M-H)-",
+               "(M+H)+", "(M+H-H2O)+", "(M+NH4)+", "(M+Na)+", "(M+K)+", "(2M+H)+"),
+    n_mol  = c(1, 1, 1, 1, 1, 1, 1, 1, 2,
+               1, 1, 1, 1, 1, 2),
+    shift  = c(-1.007276, -19.017841, 59.013853, 44.998203, 34.969401,
+               20.974668, 36.948605, 18.998952, -1.007276,
+               1.007276, -17.003289, 18.033826, 22.989221, 38.963158, 1.007276),
+    stringsAsFactors = FALSE
+  )
+  unknown <- setdiff(adducts, known$adduct)
+  if (length(unknown) > 0) {
+    stop(sprintf("Unknown adduct(s) in annotation$ms1_adducts: %s (known: %s)",
+                 paste(unknown, collapse = ", "), paste(known$adduct, collapse = ", ")))
+  }
+  known[match(adducts, known$adduct), , drop = FALSE]
+}
+
+#' Index window of sorted database masses matching each feature m/z
+#'
+#' @return list(lo, hi) per feature; hi < lo means no compound in tolerance
+mass_window_hits <- function(mz, masses, n_mol, shift, ppm) {
+  neutral <- (mz - shift) / n_mol
+  tol <- mz * ppm * 1e-6 / n_mol
+  list(lo = findInterval(neutral - tol, masses, left.open = TRUE) + 1L,
+       hi = findInterval(neutral + tol, masses))
+}
+
+#' Accurate-mass (MS1) candidates for every feature
+#'
+#' Columns follow metid's annotation table so downstream code sees one format;
+#' mz.match.score uses metid's formula, exp(-0.5 * (ppm error / tolerance)^2).
+#'
+#' @param features data.frame(variable_id, mz)
+#' @param db Naming set from build_endogenous_naming_db()
+#' @param adducts adduct_definitions() table, in preference order
+#' @param ppm Match tolerance
+#' @return data.frame of candidates, or NULL when nothing matches
+ms1_mass_candidates <- function(features, db, adducts, ppm) {
+  db <- db[order(db$mono_mass), , drop = FALSE]
+  hits <- vector("list", nrow(adducts))
+  for (a in seq_len(nrow(adducts))) {
+    w <- mass_window_hits(features$mz, db$mono_mass, adducts$n_mol[a],
+                          adducts$shift[a], ppm)
+    n <- pmax(w$hi - w$lo + 1L, 0L)
+    has <- which(n > 0)
+    if (length(has) == 0) next
+    db_row <- unlist(lapply(has, function(i) seq.int(w$lo[i], w$hi[i])),
+                     use.names = FALSE)
+    hits[[a]] <- data.frame(feature_row = rep(has, n[has]), db_row = db_row,
+                            adduct_rank = a, stringsAsFactors = FALSE)
+  }
+  hits <- do.call(rbind, hits)
+  if (is.null(hits) || nrow(hits) == 0) return(NULL)
+
+  a <- hits$adduct_rank
+  obs_mz <- features$mz[hits$feature_row]
+  theo_mz <- adducts$n_mol[a] * db$mono_mass[hits$db_row] + adducts$shift[a]
+  err <- abs(theo_mz - obs_mz) / obs_mz * 1e6
+  m <- db[hits$db_row, , drop = FALSE]
+  data.frame(
+    variable_id     = features$variable_id[hits$feature_row],
+    Compound.name   = m$Compound.name,
+    CAS.ID          = m$CAS.ID,
+    HMDB.ID         = m$HMDB.ID,
+    KEGG.ID         = m$KEGG.ID,
+    Lab.ID          = m$Lab.ID,
+    Formula         = m$Formula,
+    Adduct          = adducts$adduct[a],
+    mz.error        = err,
+    mz.match.score  = exp(-0.5 * (err / ppm)^2),
+    RT.error        = NA_real_,
+    RT.match.score  = NA_real_,
+    CE              = NA_character_,
+    SS              = NA_real_,
+    Total.score     = exp(-0.5 * (err / ppm)^2),
+    Database        = m$Database,
+    Level           = 3,
+    database_source = m$Database,
+    adduct_rank     = a,
+    hmdb_status     = m$hmdb_status,
+    Super_class     = m$Super_class,
+    Class           = m$Class,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Share of features with an accurate-mass candidate, real vs decoy m/z
+#'
+#' Decoys are the feature m/z values shifted by whole Daltons: nothing was
+#' measured there, so their match rate is the rate at which this search space
+#' "annotates" a feature by chance.
+ms1_chance_rate <- function(mz, masses, adducts, ppm,
+                            shifts = c(-11, -7, -3, 3, 7, 11)) {
+  masses <- sort(masses)
+  any_hit <- function(x) {
+    hit <- rep(FALSE, length(x))
+    for (a in seq_len(nrow(adducts))) {
+      w <- mass_window_hits(x, masses, adducts$n_mol[a], adducts$shift[a], ppm)
+      hit <- hit | (w$hi >= w$lo)
+    }
+    hit
+  }
+  real <- mean(any_hit(mz))
+  decoy <- mean(vapply(shifts, function(s) mean(any_hit(mz + s)), numeric(1)))
+  list(real = real, decoy = decoy,
+       chance_share = if (real > 0) decoy / real else NA_real_)
+}
+
+#' Locate the mummichog pathway library (downloaded and converted once)
+#'
+#' MetaboAnalystR 4.2 reads libraries with qs::qread, but metaboanalyst.ca now
+#' serves them in qs2 format, which qs cannot read ("QS format not detected").
+#' The library is downloaded once, re-saved with qs::qsave under
+#' <working_dir>/<cache_dir>/mummichog/, and reused from there. Step 6 takes
+#' the organism's KEGG metabolic compounds from it; Step 7 runs on it.
+#'
+#' @return Path to the cached library, or NULL when it cannot be obtained
+mummichog_library_file <- function(cfg) {
+  org <- cfg$kegg$organism %||% "mmu"
+  lib <- paste0(org, "_kegg")
+  cache_dir <- file.path(cfg$project$working_dir,
+                         cfg$performance$cache_dir %||% "cache", "mummichog")
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  cached <- file.path(cache_dir, paste0(lib, ".qs"))
+  if (file.exists(cached)) return(cached)
+
+  url <- paste0("https://www.metaboanalyst.ca/resources/libs/mummichog/", lib, ".qs")
+  raw <- file.path(cache_dir, paste0(lib, ".download"))
+  ok <- tryCatch({
+    download.file(url, raw, mode = "wb", quiet = TRUE)
+    TRUE
+  }, error = function(e) {
+    cat(sprintf("   Could not download %s: %s\n", url, conditionMessage(e)))
+    FALSE
+  })
+  if (!ok) return(NULL)
+  obj <- tryCatch(qs::qread(raw), error = function(e) NULL)
+  if (is.null(obj) && requireNamespace("qs2", quietly = TRUE)) {
+    obj <- tryCatch(qs2::qs_read(raw), error = function(e) NULL)
+  }
+  unlink(raw)
+  if (is.null(obj) || is.null(obj$cpd.lib)) {
+    cat(sprintf("   %s is not a readable mummichog library (the qs2 package reads the current format)\n",
+                lib))
+    return(NULL)
+  }
+  qs::qsave(obj, cached)
+  cat(sprintf("   Cached mummichog library %s: %d compounds, %d pathways\n",
+              cached, length(obj$cpd.lib$id), length(obj$pathways$name)))
+  cached
+}
+
+#' Endogenous naming set for accurate-mass candidates
+#'
+#' An accurate mass alone cannot tell an endogenous metabolite from the isobaric
+#' drugs, pesticides and plant products that fill HMDB/ChEBI/FooDB: searched
+#' against all ~490k of them with seven adducts, m/z values shifted by a few Da
+#' (decoys) were "annotated" as often as the real features (Batch1: 90% vs 91%).
+#' Candidate names therefore come only from compounds expected in mammalian
+#' cells:
+#'   * HMDB entries with status quantified/detected that carry a cellular
+#'     location (the exposome-era entries — drugs, pesticides, industrial
+#'     chemicals detected in blood — have none);
+#'   * compounds of the organism's KEGG metabolic pathways (the mummichog
+#'     library that Step 7 also uses).
+#'
+#' @return list(db = data.frame with mono_mass, notes = character)
+build_endogenous_naming_db <- function(cfg) {
+  ann_cfg <- cfg$annotation
+  sources <- cfg_values(ann_cfg$ms1_naming_sources, c("HMDB", "KEGG"))
+  org <- cfg$kegg$organism %||% "mmu"
+  blank_na <- function(x) { x <- as.character(x); x[!is.na(x) & !nzchar(x)] <- NA; x }
+  parts <- list()
+  notes <- character(0)
+
+  if ("HMDB" %in% sources) {
+    path <- file.path(ann_cfg$ms1_db_dir, "HMDB/hmdb_ms1_database.rda")
+    env <- new.env()
+    load(path, envir = env)
+    si <- get("hmdb_ms1", envir = env)@spectra.info
+    # Prefer the explicit monoisotopic column: `mz` held the average weight in
+    # the 2026-07 build (database file patched 2026-10-09).
+    mass <- if ("monisotopic_molecular_weight" %in% colnames(si)) {
+      suppressWarnings(as.numeric(si$monisotopic_molecular_weight))
+    } else {
+      suppressWarnings(as.numeric(si$mz))
+    }
+    err <- db_mass_error_ppm(mass, si$Formula)
+    if (!is.na(err) && err > 5) {
+      stop(sprintf("HMDB masses are not monoisotopic (median %.0f ppm from formula masses): %s",
+                   err, path))
+    }
+    status_keep <- cfg_values(ann_cfg$hmdb_status, c("quantified", "detected"))
+    need_loc <- !isFALSE(ann_cfg$hmdb_require_cellular_location)
+    keep <- !is.na(mass) & si$status %in% status_keep
+    if (need_loc) keep <- keep & !is.na(si$Cellular_locations) & nzchar(si$Cellular_locations)
+    parts$HMDB <- data.frame(
+      Lab.ID = si$Lab.ID, Compound.name = si$Compound.name, mono_mass = mass,
+      Formula = si$Formula, HMDB.ID = blank_na(si$HMDB.ID), KEGG.ID = blank_na(si$KEGG.ID),
+      CAS.ID = si$CAS.ID, Database = "HMDB", hmdb_status = si$status,
+      Super_class = si$Super_class, Class = si$Class,
+      stringsAsFactors = FALSE
+    )[keep, , drop = FALSE]
+    hmdb_formula <- setNames(as.character(si$Formula), si$HMDB.ID)
+    notes <- c(notes, sprintf(
+      "HMDB: %d of %d entries (status %s%s); formula-mass check: median %.2f ppm",
+      sum(keep), nrow(si), paste(status_keep, collapse = "/"),
+      if (need_loc) ", with a cellular location" else "", err))
+    rm(env)
+  }
+
+  if ("KEGG" %in% sources) {
+    lib_file <- mummichog_library_file(cfg)
+    if (!is.null(lib_file)) {
+      lib <- qs::qread(lib_file)$cpd.lib
+      kegg <- data.frame(
+        Lab.ID = lib$id, Compound.name = lib$name, mono_mass = as.numeric(lib$mw),
+        Formula = NA_character_, HMDB.ID = blank_na(unname(lib$hmdb_ids)), KEGG.ID = lib$id,
+        CAS.ID = NA_character_, Database = paste0("KEGG_", org), hmdb_status = NA_character_,
+        Super_class = NA_character_, Class = NA_character_,
+        stringsAsFactors = FALSE
+      )
+      if (!is.null(parts$HMDB)) {
+        # Carry KEGG IDs onto HMDB rows, then drop KEGG rows already present.
+        h <- parts$HMDB
+        fill <- is.na(h$KEGG.ID) & h$HMDB.ID %in% kegg$HMDB.ID
+        h$KEGG.ID[fill] <- kegg$KEGG.ID[match(h$HMDB.ID[fill], kegg$HMDB.ID)]
+        parts$HMDB <- h
+        dup <- kegg$KEGG.ID %in% h$KEGG.ID |
+          (!is.na(kegg$HMDB.ID) & kegg$HMDB.ID %in% h$HMDB.ID)
+        kegg <- kegg[!dup, , drop = FALSE]
+      }
+      parts$KEGG <- kegg[!is.na(kegg$mono_mass), , drop = FALSE]
+      notes <- c(notes, sprintf(
+        "KEGG %s metabolic-pathway compounds (mummichog library): %d not already in the HMDB set",
+        org, nrow(parts$KEGG)))
+    } else {
+      notes <- c(notes, sprintf("KEGG %s compounds: library unavailable, HMDB set only", org))
+    }
+  }
+
+  db <- do.call(rbind, parts)
+  if (is.null(db) || nrow(db) == 0) {
+    stop("Endogenous naming set is empty — check annotation$ms1_naming_sources")
+  }
+  rownames(db) <- NULL
+  # Formulas of all HMDB entries, for compounds identified by MS2 libraries
+  # (their records carry no formula) outside the naming set
+  list(db = db, notes = notes,
+       hmdb_formula = if (exists("hmdb_formula", inherits = FALSE)) hmdb_formula else character(0))
+}
+
+#' MS2 spectral-library matching against one library
+#'
+#' Libraries without spectra for the acquisition polarity are skipped: metid
+#' would silently fall back to accurate-mass matching against them (the GNPS NIH
+#' Clinical Collection — a drug library with no negative-mode spectra — named a
+#' glutathione-like ion "LETROZOLE" that way). Only rows with an actual spectral
+#' similarity (SS > 0) are kept.
+#'
+#' @return Annotation table (metid columns + database_source), or NULL
+match_ms2_library <- function(object2, db_name, reg, cfg) {
+  ann_cfg <- cfg$annotation
+  polarity <- cfg$feature_extraction$polarity
+  path <- file.path(ann_cfg$ms2_db_dir, reg$file)
+  if (!file.exists(path)) {
+    cat(sprintf("   %s: not found (%s), skipped\n", reg$label, path))
+    return(NULL)
+  }
+  env <- new.env()
+  load(path, envir = env)
+  db_obj <- get(reg$obj, envir = env)
+  rm(env)
+  slot_name <- if (polarity == "positive") "Spectra.positive" else "Spectra.negative"
+  n_spec <- length(db_obj@spectra.data[[slot_name]])
+  if (n_spec == 0) {
+    cat(sprintf("   %s: no %s-mode spectra, skipped\n", reg$label, polarity))
+    return(NULL)
+  }
+  si <- db_obj@spectra.info
+  if ("Lab.ID" %in% colnames(si)) si$Lab.ID <- as.character(si$Lab.ID)
+  for (sc in setdiff(c("Compound.name", "CAS.ID", "HMDB.ID", "KEGG.ID", "Formula", "RT"),
+                     colnames(si))) {
+    si[[sc]] <- NA
+  }
+  db_obj@spectra.info <- si
+  err <- db_mass_error_ppm(si$mz, si$Formula)
+  if (!is.na(err) && err > 5) {
+    cat(sprintf("   %s: precursor masses disagree with formulas (median %.0f ppm), skipped\n",
+                reg$label, err))
+    return(NULL)
+  }
+  cat(sprintf("   %s: %d %s-mode spectra, matching...\n", reg$label, n_spec, polarity))
+  annotated <- annotate_metabolites_mass_dataset(
+    object = object2,
+    ms1.match.ppm = ann_cfg$ms1_match_ppm,
+    ms2.match.ppm = ann_cfg$ms2_match_ppm,
+    mz.ppm.thr = 400,
+    ms2.match.tol = ann_cfg$ms2_match_tol,
+    rt.match.tol = ann_cfg$rt_tol_external,
+    polarity = polarity,
+    column = ann_cfg$column %||% "hilic",
+    ms1.match.weight = ann_cfg$ms1_match_weight %||% 0.25,
+    rt.match.weight = ann_cfg$rt_match_weight %||% 0.25,
+    ms2.match.weight = ann_cfg$ms2_match_weight %||% 0.5,
+    total.score.tol = ann_cfg$total_score_tol %||% 0.5,
+    candidate.num = ann_cfg$candidate_num %||% 3,
+    database = db_obj
+  )
+  tab <- extract_annotation_table(annotated)
+  if (is.null(tab) || nrow(tab) == 0) {
+    cat("     no spectral matches\n")
+    return(NULL)
+  }
+  tab <- tab[!is.na(tab$SS) & tab$SS > 0, , drop = FALSE]
+  cat(sprintf("     %d spectral matches on %d features\n",
+              nrow(tab), length(unique(tab$variable_id))))
+  if (nrow(tab) == 0) return(NULL)
+  tab$database_source <- db_name
+  tab
+}
+
+#' In-house standards: accurate mass + retention time (optional)
+#'
+#' Keeps only matches inside rt_tol_inhouse. Refused when the database's masses
+#' disagree with its formulas (the current in-house file: 3/295 consistent).
+match_inhouse_standards <- function(object2, cfg) {
+  ann_cfg <- cfg$annotation
+  env <- new.env()
+  load(ann_cfg$inhouse_db_path, envir = env)
+  db_obj <- get("inhouse_Metabolite.database", envir = env)
+  rm(env)
+  err <- db_mass_error_ppm(db_obj@spectra.info$mz, db_obj@spectra.info$Formula)
+  if (!is.na(err) && err > 5) {
+    cat(sprintf("   In-house DB: masses disagree with formulas (median %.0f ppm), skipped\n", err))
+    return(NULL)
+  }
+  db_obj@spectra.info$Lab.ID <- as.character(db_obj@spectra.info$Lab.ID)
+  annotated <- annotate_metabolites_mass_dataset(
+    object = object2,
+    ms1.match.ppm = ann_cfg$ms1_match_ppm,
+    rt.match.tol = ann_cfg$rt_tol_inhouse,
+    polarity = cfg$feature_extraction$polarity,
+    column = ann_cfg$column %||% "hilic",
+    database = db_obj
+  )
+  tab <- extract_annotation_table(annotated)
+  if (is.null(tab) || nrow(tab) == 0) return(NULL)
+  tab <- tab[!is.na(tab$RT.error), , drop = FALSE]
+  cat(sprintf("   In-house standards: %d m/z + RT matches\n", nrow(tab)))
+  if (nrow(tab) == 0) return(NULL)
+  tab$database_source <- "inhouse"
+  tab
+}
+
+#' Lock-mass ions for m/z recalibration, negative mode (HILIC, cell lysate)
+#'
+#' [M-H]- of ubiquitous, abundant cell metabolites and lipids, the TFA solvent
+#' contaminant and the acetate adduct of PC 34:1. Each is located as the most
+#' intense feature within +/- window_da; wrong picks are rejected by the fit.
+RECAL_ANCHORS_NEG <- c(
+  "Lactate" = 89.024418, "TFA" = 112.985587, "Succinate" = 117.019332,
+  "Taurine" = 124.007390, "Aspartate" = 132.030230, "Malate" = 133.014247,
+  "Hypoxanthine" = 135.031570, "Glutamine" = 145.061865, "Glutamate" = 146.045890,
+  "Hexose" = 179.056113, "Citrate" = 191.019731, "Pantothenate" = 218.103393,
+  "Myristate" = 227.201654, "Palmitate" = 255.232954, "Oleate" = 281.248604,
+  "Stearate" = 283.264254, "Arachidonate" = 303.232954, "Glutathione" = 306.076527,
+  "DHA" = 327.232954, "AMP" = 346.055826, "Cholesterol sulfate" = 465.304363,
+  "Taurocholate" = 514.284394, "UDP-glucuronate" = 579.026553,
+  "UDP-GlcNAc" = 606.074289, "GSSG" = 611.144765, "PE 38:4" = 766.538946,
+  "PC 34:1 acetate" = 818.591711, "PI 36:4" = 857.518238, "PI 38:4" = 885.549538
+)
+
+#' Recalibrate feature m/z against lock-mass ions
+#'
+#' A drifted TOF calibration shifts every m/z by a smooth function of m/z:
+#' Batch5 reads palmitate ([M-H]- 255.2330) at 255.1968 (-142 ppm), Batch6
+#' at -10 ppm, Batch2 at +7 ppm, while Batches 1/3/4 stay within ~3 ppm. With a
+#' 10 ppm window a drifted batch cannot be annotated, its MS2 spectra match no
+#' library and its features do not align with the other batches.
+#'
+#' Each RECAL_ANCHORS_NEG ion is located as the most intense feature within
+#' +/- window_da. Polynomials of degree 1-3 in m/z (Da error) are fitted to every
+#' subset of degree + 1 anchors; a fit's support is the number of anchors within
+#' tol_ppm of it. The lowest degree within 2 anchors of the best support wins
+#' (a cubic otherwise bends to one wrong pick), and is refitted on its inlier
+#' anchors. A fit on random features from a drift-free run (and a fit to
+#' wrongly picked features) finds no common curve, which is why anchors are
+#' curated ions rather than database matches: fitted to chance database pairs,
+#' the curve for Batch6 came out at -226 ppm at m/z 100.
+#'
+#' The correction is applied when the inlier anchors' median |error| is at least
+#' min_median_ppm. Outside the anchors' m/z range it is held at its boundary
+#' value in ppm. Where that boundary correction exceeds uncalibrated_ppm the
+#' extrapolation cannot be trusted (Batch5 below m/z ~180), so those features
+#' get mz_calibrated = FALSE and no accurate-mass candidates. Feature m/z and MS2
+#' precursor and fragment m/z are corrected; the original feature m/z is kept
+#' as mz_raw.
+#'
+#' @param object2 mass_dataset
+#' @param cfg Validated config list (annotation$mz_recalibration)
+#' @return list(object2, applied, lines)
+recalibrate_mz <- function(object2, cfg) {
+  rc <- cfg$annotation$mz_recalibration %||% list()
+  out_dir <- file.path(cfg$project$output_dir, "06_Annotation")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  report_file <- file.path(out_dir, "mass_calibration.txt")
+  unlink(file.path(out_dir, "mass_calibration_anchors.csv"))
+  cat("\n----- Step 6 (pre): m/z calibration check against lock-mass ions -----\n")
+  vi <- object2@variable_info
+  vi$mz_calibrated <- TRUE
+  object2@variable_info <- vi
+  if (isFALSE(rc$enabled) || cfg$feature_extraction$polarity != "negative") {
+    writeLines(sprintf("m/z recalibration not run (%s)",
+                       if (isFALSE(rc$enabled)) "disabled in config" else "lock masses defined for negative mode only"),
+               report_file)
+    cat("   Not run (disabled, or positive mode without lock masses)\n")
+    return(list(object2 = object2, applied = FALSE))
+  }
+  window_da  <- rc$window_da %||% 0.06
+  tol_ppm    <- rc$tol_ppm %||% 5
+  min_anch   <- rc$min_anchors %||% 6
+  min_median <- rc$min_median_ppm %||% 5
+  uncal_ppm  <- rc$uncalibrated_ppm %||% 20
+
+  intensity <- apply(as.matrix(object2@expression_data), 1, median, na.rm = TRUE)
+  inten <- intensity[vi$variable_id]
+  anchors <- do.call(rbind, lapply(names(RECAL_ANCHORS_NEG), function(nm) {
+    m <- RECAL_ANCHORS_NEG[[nm]]
+    idx <- which(abs(vi$mz - m) <= window_da)
+    if (length(idx) == 0) return(NULL)
+    k <- idx[which.max(inten[idx])]
+    data.frame(ion = nm, theo = m, observed = vi$mz[k], variable_id = vi$variable_id[k],
+               err = vi$mz[k] - m, stringsAsFactors = FALSE)
+  }))
+  sc <- function(m) (m - 500) / 500
+  design <- function(m, deg) outer(sc(m), 0:deg, `^`)
+  lines <- c(sprintf("m/z calibration check — %s", cfg$project$name),
+             sprintf("Lock-mass ions located (most intense feature within +/- %.3f Da): %d of %d",
+                     window_da, if (is.null(anchors)) 0L else nrow(anchors), length(RECAL_ANCHORS_NEG)))
+  if (is.null(anchors) || nrow(anchors) < min_anch) {
+    lines <- c(lines, "=> Too few lock-mass ions found; m/z unchanged.")
+    writeLines(lines, report_file)
+    cat("   Too few lock-mass ions found; m/z unchanged\n")
+    return(list(object2 = object2, applied = FALSE, lines = lines))
+  }
+
+  ppm_res <- function(cf, deg) abs(anchors$err - drop(design(anchors$theo, deg) %*% cf)) /
+    anchors$theo * 1e6
+  best <- list()
+  for (deg in 1:3) {
+    if (nrow(anchors) < deg + 2) next
+    top <- list(n = -1)
+    for (s in combn(nrow(anchors), deg + 1, simplify = FALSE)) {
+      cf <- tryCatch(solve(design(anchors$theo[s], deg), anchors$err[s]), error = function(e) NULL)
+      if (is.null(cf)) next
+      res <- ppm_res(cf, deg)
+      n <- sum(res <= tol_ppm)
+      spread <- if (n > 0) median(res[res <= tol_ppm]) else Inf
+      if (n > top$n || (n == top$n && spread < top$spread)) top <- list(n = n, spread = spread, cf = cf)
+    }
+    best[[as.character(deg)]] <- top
+  }
+  n_by_deg <- vapply(best, function(b) b$n, numeric(1))
+  deg <- min(as.integer(names(n_by_deg))[n_by_deg >= max(n_by_deg) - 2])
+  inl <- ppm_res(best[[as.character(deg)]]$cf, deg) <= tol_ppm
+  if (sum(inl) < min_anch) {
+    lines <- c(lines, sprintf("=> Only %d lock-mass ions agree on a calibration curve; m/z unchanged.", sum(inl)))
+    writeLines(lines, report_file)
+    cat(sprintf("   Only %d lock-mass ions agree on a curve; m/z unchanged\n", sum(inl)))
+    return(list(object2 = object2, applied = FALSE, lines = lines))
+  }
+  a_in <- anchors[inl, , drop = FALSE]
+  cf <- qr.solve(design(a_in$theo, deg), a_in$err)
+  m_lo <- min(a_in$theo); m_hi <- max(a_in$theo)
+  ppm_at <- function(m) {
+    mc <- pmin(pmax(m, m_lo), m_hi)
+    1e6 * drop(design(mc, deg) %*% cf) / mc
+  }
+  correct <- function(m) m * (1 - ppm_at(m) * 1e-6)
+  med_err <- median(abs(1e6 * a_in$err / a_in$theo))
+  anchors$inlier <- inl
+  anchors$error_ppm <- round(1e6 * anchors$err / anchors$theo, 2)
+  write.csv(anchors[, c("ion", "theo", "observed", "variable_id", "error_ppm", "inlier")],
+            file.path(out_dir, "mass_calibration_anchors.csv"), row.names = FALSE)
+
+  grid <- c(100, 150, 200, 300, 400, 500, 700, 900, 1100)
+  lines <- c(lines,
+             sprintf("Calibration curve: degree %d through %d of %d lock masses (within %g ppm), m/z %.0f-%.0f",
+                     deg, sum(inl), nrow(anchors), tol_ppm, m_lo, m_hi),
+             paste0("   ", sprintf("%-20s %+8.1f ppm%s", anchors$ion, anchors$error_ppm,
+                                   ifelse(anchors$inlier, "", "   (rejected: not this ion)"))),
+             sprintf("Median |error| of the agreeing lock masses: %.1f ppm", med_err))
+  if (med_err < min_median) {
+    lines <- c(lines, sprintf("=> Below %g ppm: calibration acceptable, m/z unchanged.", min_median))
+    writeLines(lines, report_file)
+    cat(sprintf("   Calibration OK: %d lock masses, median |error| %.1f ppm — m/z unchanged\n",
+                sum(inl), med_err))
+    return(list(object2 = object2, applied = FALSE, lines = lines))
+  }
+
+  outside <- vi$mz < m_lo | vi$mz > m_hi
+  edge_ppm <- abs(ppm_at(vi$mz))
+  uncal <- outside & edge_ppm > uncal_ppm
+  lines <- c(lines,
+             "=> Correction applied. Error before correction (ppm), held constant outside the lock-mass range:",
+             sprintf("   m/z %4.0f  %+7.1f", grid, ppm_at(grid)),
+             sprintf("Features outside the lock-mass range with a boundary correction > %g ppm: %d (mz_calibrated = FALSE; no accurate-mass candidates)",
+                     uncal_ppm, sum(uncal)))
+  writeLines(lines, report_file)
+  cat(sprintf("   m/z drift: median %.1f ppm over %d lock masses (degree %d, m/z %.0f-%.0f) — corrected\n",
+              med_err, sum(inl), deg, m_lo, m_hi))
+  cat(sprintf("   error before correction: %s ppm at m/z %s\n",
+              paste(sprintf("%+.0f", ppm_at(grid)), collapse = "/"), paste(grid, collapse = "/")))
+  if (any(uncal)) {
+    cat(sprintf("   %d features outside the calibrated range flagged mz_calibrated = FALSE\n", sum(uncal)))
+  }
+
+  vi$mz_raw <- vi$mz
+  vi$mz <- correct(vi$mz)
+  vi$mz_calibrated <- !uncal
+  object2@variable_info <- vi
+  # MS2 precursors and fragments share the instrument calibration
+  if (length(object2@ms2_data) > 0) {
+    for (k in seq_along(object2@ms2_data)) {
+      md <- object2@ms2_data[[k]]
+      md@ms2_mz <- correct(md@ms2_mz)
+      md@ms2_spectra <- lapply(md@ms2_spectra, function(sp) {
+        if (is.null(sp) || NROW(sp) == 0) return(sp)
+        mz_col <- if ("mz" %in% colnames(sp)) "mz" else 1
+        sp[, mz_col] <- correct(as.numeric(sp[, mz_col]))
+        sp
+      })
+      object2@ms2_data[[k]] <- md
+    }
+  }
+  list(object2 = object2, applied = TRUE, lines = lines)
+}
+
+#' Features that are the 13C isotope peak of a co-eluting, stronger feature
+#'
+#' CAMERA is off, so nothing groups isotopes; a quarter to a third of all
+#' features here are M+1 peaks (Batch1: 32%). Given their own accurate-mass
+#' candidates or SIRIUS structures they become extra "metabolites" — SIRIUS
+#' named the 13C peak of a phosphatidylcholine a PEG detergent. A feature counts
+#' as an isotope when a feature 1.003355 Da lighter (within ppm) elutes within
+#' rt_tol seconds, is more intense, and correlates with it across samples.
+#'
+#' @return Named character vector variable_id -> parent variable_id (NA = none)
+find_c13_isotopes <- function(object2, ppm = 10, rt_tol = 3, min_cor = 0.7) {
+  vi <- object2@variable_info
+  expr <- log2(pmax(as.matrix(object2@expression_data[vi$variable_id, , drop = FALSE]), 1))
+  inten <- apply(expr, 1, median, na.rm = TRUE)
+  ord <- order(vi$mz)
+  mz <- vi$mz[ord]
+  lo <- findInterval(mz - 1.003355 - mz * ppm * 1e-6, mz, left.open = TRUE) + 1L
+  hi <- findInterval(mz - 1.003355 + mz * ppm * 1e-6, mz)
+  parent <- rep(NA_character_, length(mz))
+  for (i in which(hi >= lo)) {
+    j <- seq.int(lo[i], hi[i])
+    oi <- ord[i]
+    oj <- ord[j]
+    oj <- oj[abs(vi$rt[oj] - vi$rt[oi]) <= rt_tol & inten[oj] > inten[oi]]
+    if (length(oj) == 0) next
+    r <- vapply(oj, function(k) suppressWarnings(cor(expr[oi, ], expr[k, ], use = "complete.obs")),
+                numeric(1))
+    ok <- !is.na(r) & r >= min_cor
+    if (any(ok)) parent[i] <- vi$variable_id[oj[ok][which.max(inten[oj[ok]])]]
+  }
+  setNames(parent[order(ord)], vi$variable_id)
+}
+
+#' Run metabolite annotation: MS2 libraries + endogenous accurate-mass candidates
+#'
+#' Evidence, strongest first:
+#'   inhouse_mz_rt  — m/z + RT match to an in-house standard (if enabled)
+#'   MS2_library    — MS2 spectral match (HMDB/GNPS/MassBank/MoNA)       → Level 2
+#'   MS1_endogenous — accurate-mass candidate from the endogenous set     → Level 3
+#' Candidates of all sources are pooled per feature and ranked by evidence,
+#' then adduct preference, score and db_priority — a weak hit from a library
+#' listed early can no longer hide a spectral match from one listed later.
+#' SIRIUS evidence is added by run_sirius_analysis(); feature-level levels and
+#' names are set by finalize_annotation().
+#'
+#' @param object2 mass_dataset object with MS2 spectra loaded (m/z recalibrated)
 #' @param cfg Validated config list
-#' @return data.frame of merged annotations with confidence levels, or NULL
-run_annotation <- function(object2, cfg) {
-  cat("\n===== Step 6: Metabolite annotation (enhanced) =====\n")
+#' @param naming Output of build_endogenous_naming_db() (built here if NULL)
+#' @return data.frame of ranked candidates (several rows per feature), or NULL
+run_annotation <- function(object2, cfg, naming = NULL) {
+  cat("\n===== Step 6: Metabolite annotation (MS2 libraries + endogenous accurate mass) =====\n")
 
   out_dir <- file.path(cfg$project$output_dir, "06_Annotation")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   ann_cfg <- cfg$annotation
+  polarity <- cfg$feature_extraction$polarity
+  ppm <- ann_cfg$ms1_match_ppm
+  qc_lines <- character(0)
 
-  # ── Build comprehensive database source list ─────────────────────────────
-  db_sources <- list()
-  # The in-house DB is opt-in: its mz column does not match its own formulas,
-  # so when enabled it is loaded but must not be given merge priority.
+  features <- object2@variable_info %>% dplyr::select(variable_id, mz, rt)
+  isotope_of <- if ("isotope_of" %in% colnames(object2@variable_info)) {
+    setNames(object2@variable_info$isotope_of, object2@variable_info$variable_id)
+  } else {
+    find_c13_isotopes(object2)
+  }
+  n_iso <- sum(!is.na(isotope_of))
+  cat(sprintf("   13C isotope peaks of co-eluting features: %d of %d (no candidates of their own)\n",
+              n_iso, nrow(features)))
+  mono <- features[is.na(isotope_of[features$variable_id]), , drop = FALSE]
+  if ("mz_calibrated" %in% colnames(object2@variable_info)) {
+    uncal_ids <- object2@variable_info$variable_id[!object2@variable_info$mz_calibrated]
+    if (length(uncal_ids) > 0) {
+      cat(sprintf("   %d features outside the calibrated m/z range: no accurate-mass candidates\n",
+                  length(uncal_ids)))
+      mono <- mono[!mono$variable_id %in% uncal_ids, , drop = FALSE]
+    }
+  }
+
+  # ── In-house standards (optional) ────────────────────────────────────────
+  inhouse_tab <- NULL
   if (isTRUE(ann_cfg$inhouse_enabled)) {
-    db_sources <- c(db_sources, list(
-      list(name = "inhouse",  label = "In-house",  path = ann_cfg$inhouse_db_path, obj_name = "inhouse_Metabolite.database", type = "MS1")
-    ))
+    inhouse_tab <- tryCatch(match_inhouse_standards(object2, cfg), error = function(e) {
+      cat(sprintf("   In-house matching failed: %s\n", conditionMessage(e)))
+      NULL
+    })
   } else {
     cat("   In-house DB disabled (annotation$inhouse_enabled = FALSE)\n")
   }
-  db_sources <- c(db_sources, list(
-    # MS1 accurate-mass databases
-    list(name = "HMDB",       label = "HMDB",        path = file.path(ann_cfg$ms1_db_dir, "HMDB/hmdb_ms1_database.rda"),    obj_name = "hmdb_ms1", type = "MS1"),
-    list(name = "KEGG",       label = "KEGG",        path = file.path(ann_cfg$ms1_db_dir, "KEGG/kegg_ms1_database.rda"),    obj_name = "kegg_ms1", type = "MS1"),
-    list(name = "ChEBI",      label = "ChEBI",       path = file.path(ann_cfg$ms1_db_dir, "ChEBI/chebi_ms1_database.rda"),  obj_name = "chebi_ms1", type = "MS1"),
-    list(name = "FooDB",      label = "FooDB",       path = file.path(ann_cfg$ms1_db_dir, "FooDB/foodb_ms1_database.rda"),  obj_name = "foodb_ms1", type = "MS1"),
-    list(name = "PubChem",    label = "PubChem",     path = file.path(ann_cfg$ms1_db_dir, "PubChem/pubchem_ms1_database.rda"), obj_name = "pubchem_ms1", type = "MS1"),
-    # MS2 spectral libraries
-    list(name = "MS2_HMDB",     label = "HMDB MS2",     path = file.path(ann_cfg$ms2_db_dir, "hmdb_ms2_merged.rda"),       obj_name = "hmdb_ms2", type = "MS2"),
-    list(name = "MS2_GNPS",     label = "GNPS MS2",     path = file.path(ann_cfg$ms2_db_dir, "gnps_ms2_merged.rda"),       obj_name = "gnps_ms2", type = "MS2"),
-    list(name = "MS2_MassBank", label = "MassBank MS2", path = file.path(ann_cfg$ms2_db_dir, "massbank_ms2_merged.rda"),   obj_name = "massbank_ms2", type = "MS2"),
-    list(name = "MS2_MoNA",     label = "MoNA MS2",     path = file.path(ann_cfg$ms2_db_dir, "mona_ms2_merged.rda"),       obj_name = "mona_ms2", type = "MS2"),
-    # GNPS sub-libraries (specialised collections)
-    list(name = "MS2_GNPS_IH",  label = "GNPS IH MS2",  path = file.path(ann_cfg$ms2_db_dir, "gnps_iobanhc_ms2_merged.rda"),  obj_name = "gnps_iobanhc_ms2", type = "MS2"),
-    list(name = "MS2_GNPS_NIH", label = "GNPS NIH MS2", path = file.path(ann_cfg$ms2_db_dir, "gnps_nihclinicalcollection1_ms2_merged.rda"), obj_name = "gnps_nihclinicalcollection1_ms2", type = "MS2")
-  ))
 
-  databases <- list()
-  for (src in db_sources) {
-    if (file.exists(src$path)) {
-      tryCatch({
-        load(src$path)
-        db_obj <- get(src$obj_name)
-        if (inherits(db_obj, "databaseClass")) {
-          if ("Lab.ID" %in% colnames(db_obj@spectra.info)) {
-            db_obj@spectra.info$Lab.ID <- as.character(db_obj@spectra.info$Lab.ID)
-          }
-          # Ensure standard annotation columns exist
-          std_cols <- c("Compound.name", "CAS.ID", "HMDB.ID", "KEGG.ID", "Formula", "RT")
-          for (sc in setdiff(std_cols, colnames(db_obj@spectra.info))) {
-            db_obj@spectra.info[[sc]] <- NA
-          }
-          databases[[src$name]] <- db_obj
-          cat(sprintf("   Loaded: %s | %d compounds | type: %s\n", src$label,
-                      nrow(databases[[src$name]]@spectra.info), src$type))
-        }
-      }, error = function(e) {
-        cat(sprintf("   Load failed: %s - %s\n", src$label, conditionMessage(e)))
+  # ── Accurate-mass candidates from the endogenous naming set ──────────────
+  default_adducts <- if (polarity == "positive") {
+    c("(M+H)+", "(M+H-H2O)+", "(M+NH4)+", "(M+Na)+")
+  } else {
+    c("(M-H)-", "(M+CH3COO)-")
+  }
+  adducts <- adduct_definitions(cfg_values(ann_cfg$ms1_adducts, default_adducts))
+  if (is.null(naming)) naming <- build_endogenous_naming_db(cfg)
+  for (nt in naming$notes) cat(sprintf("   Naming set — %s\n", nt))
+  cat(sprintf("   Naming set: %d compounds; adducts: %s; %g ppm\n",
+              nrow(naming$db), paste(adducts$adduct, collapse = ", "), ppm))
+  ms1_tab <- ms1_mass_candidates(mono, naming$db, adducts, ppm)
+  chance <- ms1_chance_rate(mono$mz, naming$db$mono_mass, adducts, ppm)
+  cat(sprintf("   Accurate-mass candidates: %d features (%.1f%%); decoy m/z match rate %.1f%% (~%.0f%% of candidate hits expected by chance)\n",
+              if (is.null(ms1_tab)) 0L else length(unique(ms1_tab$variable_id)),
+              100 * chance$real, 100 * chance$decoy, 100 * chance$chance_share))
+  qc_lines <- c(qc_lines,
+                sprintf("13C isotope peaks (excluded from candidate search): %d of %d features",
+                        n_iso, nrow(features)),
+                sprintf("Accurate-mass naming set: %d compounds", nrow(naming$db)),
+                paste0("  ", naming$notes),
+                sprintf("  Adducts: %s; tolerance %g ppm", paste(adducts$adduct, collapse = ", "), ppm),
+                sprintf("  Features with a candidate: %.1f%%; decoy m/z (shifted ±3/7/11 Da): %.1f%%",
+                        100 * chance$real, 100 * chance$decoy),
+                sprintf("  => roughly %.0f%% of accurate-mass candidates are expected by chance alone;",
+                        100 * chance$chance_share),
+                "     they are reported as putative (Level 3), never as identifications.")
+
+  # ── MS2 spectral libraries ───────────────────────────────────────────────
+  ms2_registry <- list(
+    MS2_HMDB     = list(label = "HMDB MS2",     file = "hmdb_ms2_merged.rda",     obj = "hmdb_ms2"),
+    MS2_GNPS     = list(label = "GNPS MS2",     file = "gnps_ms2_merged.rda",     obj = "gnps_ms2"),
+    MS2_MassBank = list(label = "MassBank MS2", file = "massbank_ms2_merged.rda", obj = "massbank_ms2"),
+    MS2_MoNA     = list(label = "MoNA MS2",     file = "mona_ms2_merged.rda",     obj = "mona_ms2"),
+    MS2_GNPS_IH  = list(label = "GNPS IH MS2",  file = "gnps_iobanhc_ms2_merged.rda",
+                        obj = "gnps_iobanhc_ms2"),
+    MS2_GNPS_NIH = list(label = "GNPS NIH MS2", file = "gnps_nihclinicalcollection1_ms2_merged.rda",
+                        obj = "gnps_nihclinicalcollection1_ms2")
+  )
+  ms2_names <- cfg_values(ann_cfg$ms2_databases,
+                          c("MS2_HMDB", "MS2_GNPS", "MS2_GNPS_IH", "MS2_MassBank", "MS2_MoNA"))
+  ms2_tables <- list()
+  if (length(object2@ms2_data) == 0) {
+    cat("   No MS2 spectra in the dataset, spectral-library matching skipped\n")
+  } else {
+    for (db_name in ms2_names) {
+      reg <- ms2_registry[[db_name]]
+      if (is.null(reg)) {
+        cat(sprintf("   Unknown MS2 library '%s' in annotation$ms2_databases, skipped\n", db_name))
+        next
+      }
+      tab <- tryCatch(match_ms2_library(object2, db_name, reg, cfg), error = function(e) {
+        cat(sprintf("   %s: matching failed: %s\n", reg$label, conditionMessage(e)))
+        NULL
       })
-    } else {
-      # Only warn for known databases; new ones may legitimately not exist
-      cat(sprintf("   DB not found: %s (%s), skipping\n", src$label, src$path))
+      if (!is.null(tab)) ms2_tables[[db_name]] <- tab
+      invisible(gc(verbose = FALSE))
     }
   }
-  cat(sprintf("   Total databases loaded: %d\n", length(databases)))
+  qc_lines <- c(qc_lines, sprintf("MS2 spectral matches: %d features (%s)",
+                                  length(unique(unlist(lapply(ms2_tables, `[[`, "variable_id")))),
+                                  if (length(ms2_tables)) paste(names(ms2_tables), collapse = ", ") else "none"))
 
-  if (length(databases) == 0) {
-    cat("   No databases available, skipping annotation\n")
+  # ── Pool and rank candidates: evidence first, then score ─────────────────
+  if (!is.null(inhouse_tab)) inhouse_tab$evidence <- "inhouse_mz_rt"
+  ms2_all <- dplyr::bind_rows(ms2_tables)
+  if (nrow(ms2_all) > 0) ms2_all$evidence <- "MS2_library"
+  if (!is.null(ms1_tab)) ms1_tab$evidence <- "MS1_endogenous"
+  cand <- dplyr::bind_rows(inhouse_tab, ms2_all, ms1_tab)
+  writeLines(qc_lines, file.path(out_dir, "annotation_qc.txt"))
+  if (nrow(cand) == 0) {
+    cat("   No candidates from any source\n")
     return(invisible(NULL))
   }
 
-  # ── Annotate per database ────────────────────────────────────────────────
-  all_annotations <- list()
-  polarity <- cfg$feature_extraction$polarity
+  evidence_order <- c("inhouse_mz_rt", "MS2_library", "MS1_endogenous")
+  db_priority <- cfg_values(ann_cfg$db_priority, character(0))
+  max_cand <- ann_cfg$max_candidates %||% 5
 
-  for (db_name in names(databases)) {
-    cat(sprintf("   Annotating with %s...\n", db_name))
-
-    tryCatch({
-      rt_tol <- ifelse(db_name == "inhouse", ann_cfg$rt_tol_inhouse, ann_cfg$rt_tol_external)
-      has_ms2 <- length(databases[[db_name]]@spectra.data) > 0 &&
-        any(sapply(databases[[db_name]]@spectra.data, function(x) length(x) > 0))
-
-      if (has_ms2) {
-        cat("     MS2 spectra detected, using MS1+MS2 joint matching\n")
-        # Use configurable scoring weights (with defaults)
-        ms1_wt <- ann_cfg$ms1_match_weight %||% 0.25
-        rt_wt  <- ann_cfg$rt_match_weight  %||% 0.25
-        ms2_wt <- ann_cfg$ms2_match_weight %||% 0.5
-        object_annotated <- annotate_metabolites_mass_dataset(
-          object = object2,
-          ms1.match.ppm = ann_cfg$ms1_match_ppm,
-          ms2.match.ppm = ann_cfg$ms2_match_ppm,
-          mz.ppm.thr = 400,
-          ms2.match.tol = ann_cfg$ms2_match_tol,
-          rt.match.tol = rt_tol,
-          polarity = polarity,
-          ms1.match.weight = ms1_wt,
-          rt.match.weight = rt_wt,
-          ms2.match.weight = ms2_wt,
-          total.score.tol = ann_cfg$total_score_tol %||% 0.5,
-          candidate.num = ann_cfg$candidate_num %||% 3,
-          database = databases[[db_name]]
-        )
-      } else {
-        object_annotated <- annotate_metabolites_mass_dataset(
-          object = object2,
-          ms1.match.ppm = ann_cfg$ms1_match_ppm,
-          rt.match.tol = rt_tol,
-          polarity = polarity,
-          database = databases[[db_name]]
-        )
-      }
-
-      ann_table <- extract_annotation_table(object_annotated)
-      if (!is.null(ann_table) && nrow(ann_table) > 0) {
-        all_annotations[[db_name]] <- ann_table
-        cat(sprintf("     Matched %d metabolites\n", nrow(ann_table)))
-      } else {
-        cat("     No matches\n")
-      }
-    }, error = function(e) {
-      cat(sprintf("     Annotation error: %s\n", conditionMessage(e)))
-    })
-  }
-
-  # ── Merge annotations by priority ────────────────────────────────────────
-  if (length(all_annotations) == 0) {
-    cat("   No annotations from any database\n")
-    return(invisible(NULL))
-  }
-
-  db_priority_order <- ann_cfg$db_priority
-  db_order <- db_priority_order[db_priority_order %in% names(all_annotations)]
-  # Append databases not in priority list (don't silently drop evidence)
-  db_remaining <- setdiff(names(all_annotations), db_order)
-  if (length(db_remaining) > 0) {
-    cat(sprintf("   Appending %d non-priority DB(s): %s\n",
-                length(db_remaining), paste(db_remaining, collapse = ", ")))
-    db_order <- c(db_order, db_remaining)
-  }
-  cat(sprintf("   Merging %d databases, priority: %s\n",
-              length(db_order), paste(db_order, collapse = " > ")))
-
-  # MS2 evidence requires an actual spectral match (SS). Some MS2 libraries hold
-  # no spectra for this polarity (e.g. gnps_nihclinicalcollection1 has none for
-  # negative mode); metid then silently falls back to MS1-only identification,
-  # and labelling that as an MS2 hit would promote every such row to MSI Level 2.
-  ms2_match_type <- function(df, db_name) {
-    if (!grepl("^MS2_", db_name) || !"SS" %in% colnames(df)) {
-      return(rep("MS1", nrow(df)))
-    }
-    ifelse(!is.na(df$SS) & df$SS > 0, "MS2", "MS1")
-  }
-
-  # First priority database
-  merged_ann <- all_annotations[[db_order[1]]]
-  merged_ann$database_source <- db_order[1]
-  merged_ann$match_type <- ms2_match_type(merged_ann, db_order[1])
-
-  if (length(db_order) > 1) {
-    for (i in 2:length(db_order)) {
-      next_db <- all_annotations[[db_order[i]]]
-      if (is.null(next_db) || nrow(next_db) == 0) next
-      next_db$database_source <- db_order[i]
-      next_db$match_type <- ms2_match_type(next_db, db_order[i])
-      new_ann <- next_db[!next_db$variable_id %in% merged_ann$variable_id, , drop = FALSE]
-      if (nrow(new_ann) > 0) {
-        merged_ann <- bind_rows(merged_ann, new_ann)
-      }
-    }
-  }
-
-  # ── Assign MSI confidence levels ─────────────────────────────────────────
-  merged_ann <- merged_ann %>%
-    rowwise() %>%
+  cand <- cand %>%
     mutate(
-      confidence_level = assign_confidence_level(
-        has_ms2_match = (.data$match_type == "MS2"),
-        has_ms1_match = (.data$match_type == "MS1"),
-        has_rt_match  = FALSE,
-        is_inhouse    = .data$database_source == "inhouse",
-        is_sirius     = FALSE,
-        is_metfrag    = FALSE
-      )
+      Compound.name = strip_html(Compound.name),
+      .evidence_rank = match(evidence, evidence_order),
+      .adduct_rank = ifelse(is.na(adduct_rank), 0, adduct_rank),
+      .db_rank = ifelse(is.na(match(database_source, db_priority)),
+                        length(db_priority) + 1, match(database_source, db_priority)),
+      .name_key = tolower(Compound.name)
     ) %>%
-    ungroup()
+    filter(!is.na(Compound.name)) %>%
+    arrange(variable_id, .evidence_rank, .adduct_rank, desc(Total.score), .db_rank, mz.error) %>%
+    distinct(variable_id, .name_key, .keep_all = TRUE) %>%
+    group_by(variable_id) %>%
+    mutate(candidate_rank = row_number()) %>%
+    ungroup() %>%
+    filter(candidate_rank <= max_cand) %>%
+    mutate(
+      match_type = dplyr::recode(evidence, MS1_endogenous = "MS1", MS2_library = "MS2",
+                                 inhouse_mz_rt = "MS1+RT"),
+      confidence_level = ifelse(evidence == "MS1_endogenous", MSI_LEVELS[["L3"]], MSI_LEVELS[["L2"]])
+    ) %>%
+    dplyr::select(-dplyr::starts_with("."))
 
-  n_level1 <- sum(merged_ann$confidence_level == "Level 1 — Confirmed", na.rm = TRUE)
-  n_level2 <- sum(merged_ann$confidence_level == "Level 2 — Putatively identified", na.rm = TRUE)
-  n_level3 <- sum(merged_ann$confidence_level == "Level 3 — Putatively annotated", na.rm = TRUE)
-  cat(sprintf("   MSI Confidence breakdown:\n"))
-  cat(sprintf("     Level 1 — Confirmed:             %d\n", n_level1))
-  cat(sprintf("     Level 2 — Putatively identified: %d\n", n_level2))
-  cat(sprintf("     Level 3 — Putatively annotated:  %d\n", n_level3))
+  cand <- cand %>%
+    left_join(features, by = "variable_id") %>%
+    dplyr::select(variable_id, mz, rt, candidate_rank, evidence, database_source,
+                  match_type, confidence_level, Compound.name, everything())
 
-  # ── Add m/z and RT info ──────────────────────────────────────────────────
-  if (nrow(merged_ann) > 0) {
-    vi <- object2@variable_info %>%
-      dplyr::select(variable_id, mz, rt)
-    merged_ann <- merged_ann %>%
-      left_join(vi, by = "variable_id") %>%
-      dplyr::select(variable_id, mz, rt, database_source, match_type,
-                    confidence_level, Compound.name, everything())
-  }
-
-  # Merge mz/rt from peak table (for mzmin/mzmax/rtmin/rtmax)
+  # Merge mz/rt ranges from the peak table
   peak_file2 <- file.path(cfg$data$peak_table_dir, "Peak_table.csv")
   if (!file.exists(peak_file2)) peak_file2 <- file.path(cfg$data$peak_table_dir, "peak_table.csv")
   if (file.exists(peak_file2)) {
     mzrt <- read.csv(peak_file2, stringsAsFactors = FALSE)[, 1:7]
     colnames(mzrt) <- c("variable_id", "mz", "mzmin", "mzmax", "rt", "rtmin", "rtmax")
-    # Avoid duplicate mz/rt columns by dropping them from mzrt before join
-    mzrt_clean <- mzrt %>% dplyr::select(variable_id, mzmin, mzmax, rtmin, rtmax)
-    app3 <- left_join(merged_ann, mzrt_clean, by = "variable_id")
-    # Reorder: put core columns first
-    app3 <- app3 %>%
-      dplyr::select(variable_id, mz, rt, mzmin, mzmax, rtmin, rtmax,
-                    database_source, match_type, confidence_level, everything())
-  } else {
-    app3 <- merged_ann
+    # peak-table m/z ranges are pre-recalibration; shift them with the feature
+    if ("mz_raw" %in% colnames(object2@variable_info)) {
+      shift <- object2@variable_info$mz - object2@variable_info$mz_raw
+      idx <- match(mzrt$variable_id, object2@variable_info$variable_id)
+      mzrt$mzmin <- mzrt$mzmin + ifelse(is.na(idx), 0, shift[idx])
+      mzrt$mzmax <- mzrt$mzmax + ifelse(is.na(idx), 0, shift[idx])
+    }
+    cand <- cand %>%
+      left_join(mzrt %>% dplyr::select(variable_id, mzmin, mzmax, rtmin, rtmax), by = "variable_id") %>%
+      dplyr::select(variable_id, mz, rt, mzmin, mzmax, rtmin, rtmax, everything())
   }
 
-  n_unique <- length(unique(app3$Compound.name[!is.na(app3$Compound.name) &
-                                                app3$Compound.name != ""]))
-  cat(sprintf("   Merged: %d rows, %d unique compound names\n", nrow(app3), n_unique))
+  n_feat <- length(unique(cand$variable_id))
+  cat(sprintf("   Candidates: %d rows on %d features (MS2 spectral: %d features; accurate mass only: %d features)\n",
+              nrow(cand), n_feat,
+              length(unique(cand$variable_id[cand$evidence != "MS1_endogenous"])),
+              length(setdiff(unique(cand$variable_id),
+                             cand$variable_id[cand$evidence != "MS1_endogenous"]))))
+  invisible(cand)
+}
+
+#' First element, or NA for an empty vector
+first_or_na <- function(x) if (length(x) > 0) x[[1]] else NA
+
+#' Feature-level annotation: MSI level, names and display labels
+#'
+#' Runs after SIRIUS/MetFrag, once every evidence source is in. Per feature:
+#'   identified (Level 2) — an MS2 spectral-library match, or a SIRIUS
+#'     CSI:FingerID structure with COSMIC confidence >= sirius$min_structure_confidence;
+#'   putative (Level 3) — accurate-mass candidates from the endogenous set, or a
+#'     SIRIUS/CANOPUS compound class only;
+#'   unknown (Level 4) — nothing else.
+#' Only identified features carry a compound name and HMDB/KEGG IDs downstream
+#' (identified_*). Every feature gets a `display_name` for figures and the web:
+#' the identified name, "<putative name>? (<variable_id>)",
+#' "<variable_id> [<CANOPUS class>]" or "<variable_id> [13C of <parent>]" —
+#' a 13C isotope peak (find_c13_isotopes) is Level 4 and never named itself.
+#' `confidence_level` becomes the feature's level on all of its candidate rows
+#' (`candidate_level` keeps the row's own).
+#'
+#' Writes 06_Annotation/all_annotated_metabolites.csv (candidates),
+#' feature_annotation.csv (one row per feature, unmatched included), the
+#' per-level CSVs and unmatched_features.csv.
+#'
+#' @return app3 with the feature-level columns added
+finalize_annotation <- function(app3, object2, cfg, hmdb_formula = character(0)) {
+  cat("\n----- Step 6e: Feature-level annotation (MSI levels, display names) -----\n")
+  out_dir <- file.path(cfg$project$output_dir, "06_Annotation")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  unlink(list.files(out_dir, pattern = "^annotations_L[0-9]\\.csv$", full.names = TRUE))
+  if (is.null(app3) || nrow(app3) == 0) {
+    cat("   No annotation candidates\n")
+    return(app3)
+  }
+
+  min_conf <- as.numeric(cfg$sirius$min_structure_confidence %||% 0.5)
+  for (col in c("evidence", "candidate_rank", "Compound.name", "HMDB.ID", "KEGG.ID",
+                "database_source", "Adduct", "mz.error", "confidence_level", "Formula",
+                "sirius_name", "sirius_confidence", "sirius_formula", "canopus_cf_class")) {
+    if (!col %in% colnames(app3)) app3[[col]] <- NA
+  }
+  # SIRIUS-only rows (no library candidate) arrive without m/z / RT
+  vi <- object2@variable_info %>% dplyr::select(variable_id, .mz = mz, .rt = rt)
+  app3 <- app3 %>%
+    left_join(vi, by = "variable_id") %>%
+    mutate(mz = ifelse(is.na(mz), .mz, mz), rt = ifelse(is.na(rt), .rt, rt)) %>%
+    dplyr::select(-.mz, -.rt)
+  app3$candidate_level <- app3$confidence_level
+
+  is_lib <- function(ev) ev %in% c("inhouse_mz_rt", "MS2_library")
+  feat <- app3 %>%
+    arrange(variable_id, candidate_rank) %>%
+    group_by(variable_id) %>%
+    summarise(
+      .lib_name   = first_or_na(Compound.name[is_lib(evidence)]),
+      .lib_source = first_or_na(database_source[is_lib(evidence)]),
+      .lib_hmdb   = first_or_na(HMDB.ID[is_lib(evidence)]),
+      .lib_kegg   = first_or_na(KEGG.ID[is_lib(evidence)]),
+      .lib_formula = first_or_na(Formula[is_lib(evidence)]),
+      .level1     = any(candidate_level == MSI_LEVELS[["L1"]], na.rm = TRUE),
+      putative_name    = first_or_na(Compound.name[evidence %in% "MS1_endogenous"]),
+      putative_hmdb_id = first_or_na(HMDB.ID[evidence %in% "MS1_endogenous"]),
+      putative_kegg_id = first_or_na(KEGG.ID[evidence %in% "MS1_endogenous"]),
+      putative_adduct  = first_or_na(Adduct[evidence %in% "MS1_endogenous"]),
+      n_mass_candidates = sum(evidence %in% "MS1_endogenous"),
+      .sirius_name = first_or_na(sirius_name),
+      .sirius_conf = suppressWarnings(as.numeric(first_or_na(sirius_confidence))),
+      .sirius_formula = first_or_na(sirius_formula),
+      .class       = first_or_na(canopus_cf_class),
+      .groups = "drop"
+    )
+
+  # 13C isotope peaks carry their parent's identity, not one of their own
+  iso_map <- if ("isotope_of" %in% colnames(object2@variable_info)) {
+    setNames(object2@variable_info$isotope_of, object2@variable_info$variable_id)
+  } else {
+    find_c13_isotopes(object2)
+  }
+  feat$isotope_of <- unname(iso_map[feat$variable_id])
+  is_iso <- !is.na(feat$isotope_of)
+  feat$.lib_name[is_iso] <- NA
+  feat$putative_name[is_iso] <- NA
+  feat$putative_hmdb_id[is_iso] <- NA
+  feat$putative_kegg_id[is_iso] <- NA
+  feat$putative_adduct[is_iso] <- NA
+  feat$.class[is_iso] <- NA
+
+  sirius_ok <- !is_iso & !is.na(feat$.sirius_name) & nzchar(feat$.sirius_name) &
+    !is.na(feat$.sirius_conf) & feat$.sirius_conf >= min_conf
+  has_lib <- !is.na(feat$.lib_name)
+  feat$identified_name   <- strip_html(ifelse(has_lib, feat$.lib_name,
+                                              ifelse(sirius_ok, feat$.sirius_name, NA)))
+  feat$identified_source <- ifelse(has_lib, feat$.lib_source,
+                                   ifelse(sirius_ok, "SIRIUS_CSI:FingerID", NA))
+  feat$identified_hmdb_id <- ifelse(has_lib, feat$.lib_hmdb, NA)
+  feat$identified_kegg_id <- ifelse(has_lib, feat$.lib_kegg, NA)
+  # library records rarely carry a formula: take HMDB's for the identified ID
+  lib_formula <- ifelse(is.na(feat$.lib_formula),
+                        unname(hmdb_formula[feat$.lib_hmdb]), feat$.lib_formula)
+  feat$identified_formula <- ifelse(has_lib, lib_formula,
+                                    ifelse(sirius_ok, feat$.sirius_formula, NA))
+  feat$feature_level <- dplyr::case_when(
+    feat$.level1 ~ MSI_LEVELS[["L1"]],
+    !is.na(feat$identified_name) ~ MSI_LEVELS[["L2"]],
+    !is.na(feat$putative_name) | !is.na(feat$.class) ~ MSI_LEVELS[["L3"]],
+    TRUE ~ MSI_LEVELS[["L4"]]
+  )
+  dup_name <- !is.na(feat$identified_name) &
+    feat$identified_name %in% feat$identified_name[duplicated(feat$identified_name)]
+  feat$display_name <- dplyr::case_when(
+    !is.na(feat$identified_name) & !dup_name ~ feat$identified_name,
+    !is.na(feat$identified_name) ~ paste0(feat$identified_name, " (", feat$variable_id, ")"),
+    !is.na(feat$putative_name) ~ paste0(feat$putative_name, "? (", feat$variable_id, ")"),
+    !is.na(feat$.class) ~ paste0(feat$variable_id, " [", feat$.class, "]"),
+    is_iso ~ paste0(feat$variable_id, " [13C of ", feat$isotope_of, "]"),
+    TRUE ~ feat$variable_id
+  )
+  feat <- feat %>% dplyr::select(-dplyr::starts_with("."))
+
+  app3 <- app3 %>%
+    dplyr::select(-dplyr::any_of(setdiff(colnames(feat), "variable_id"))) %>%
+    left_join(feat, by = "variable_id") %>%
+    mutate(confidence_level = feature_level) %>%
+    arrange(variable_id, candidate_rank) %>%
+    dplyr::select(dplyr::any_of(c("variable_id", "mz", "rt", "mzmin", "mzmax", "rtmin", "rtmax",
+                                  "confidence_level", "display_name", "identified_name",
+                                  "putative_name", "candidate_rank", "evidence",
+                                  "database_source", "match_type", "Compound.name")),
+                  everything())
 
   write.csv(app3, file.path(out_dir, "all_annotated_metabolites.csv"), row.names = FALSE)
-  cat(sprintf("   Saved: %s\n", file.path(out_dir, "all_annotated_metabolites.csv")))
-
-  # Per-database stats
-  db_stats <- table(app3$database_source)
-  for (nm in names(db_stats)) {
-    cat(sprintf("     %s: %d\n", nm, db_stats[nm]))
-  }
-
-  # Save per-confidence-level CSVs
+  feature_tbl <- feature_annotation_table(app3, object2)
+  write.csv(feature_tbl, file.path(out_dir, "feature_annotation.csv"), row.names = FALSE)
   for (lvl in unique(app3$confidence_level)) {
     lvl_short <- gsub(" .*$", "", gsub("Level ", "L", lvl))
-    lvl_data <- app3[app3$confidence_level == lvl, , drop = FALSE]
-    if (nrow(lvl_data) > 0) {
-      write.csv(lvl_data,
-                file.path(out_dir, paste0("annotations_", lvl_short, ".csv")),
-                row.names = FALSE)
-    }
+    write.csv(app3[app3$confidence_level == lvl, , drop = FALSE],
+              file.path(out_dir, paste0("annotations_", lvl_short, ".csv")), row.names = FALSE)
   }
-  # Save unmatched features
-  all_var_ids <- rownames(object2@expression_data)
-  matched_ids <- unique(app3$variable_id)
-  unmatched <- setdiff(all_var_ids, matched_ids)
-  if (length(unmatched) > 0) {
-    unmatched_df <- data.frame(variable_id = unmatched, stringsAsFactors = FALSE)
-    write.csv(unmatched_df, file.path(out_dir, "unmatched_features.csv"), row.names = FALSE)
-    cat(sprintf("   Unmatched features: %d -> unmatched_features.csv\n", length(unmatched)))
-  }
+  unmatched <- feature_tbl[feature_tbl$feature_level == MSI_LEVELS[["L4"]],
+                           c("variable_id", "mz", "rt"), drop = FALSE]
+  write.csv(unmatched, file.path(out_dir, "unmatched_features.csv"), row.names = FALSE)
 
-  invisible(app3)
+  lv <- table(factor(feature_tbl$feature_level, levels = MSI_LEVELS))
+  cat(sprintf("   Features: %d | L1 %d | L2 %d (identified) | L3 %d (putative) | L4 %d (unknown)\n",
+              nrow(feature_tbl), lv[[1]], lv[[2]], lv[[3]], lv[[4]]))
+  cat(sprintf("   Saved: %s (+ feature_annotation.csv)\n",
+              file.path(out_dir, "all_annotated_metabolites.csv")))
+  app3
+}
+
+#' One row per feature (all features, unmatched as Level 4)
+#'
+#' @param app3 Output of finalize_annotation()
+#' @param object2 mass_dataset
+feature_annotation_table <- function(app3, object2) {
+  feat_cols <- c("variable_id", "feature_level", "display_name", "identified_name",
+                 "identified_source", "identified_hmdb_id", "identified_kegg_id",
+                 "putative_name", "putative_hmdb_id", "putative_kegg_id", "putative_adduct",
+                 "n_mass_candidates", "isotope_of", "sirius_name", "sirius_confidence", "sirius_formula",
+                 "canopus_cf_superclass", "canopus_cf_class", "canopus_npc_pathway")
+  per_feature <- app3 %>%
+    arrange(variable_id, candidate_rank) %>%
+    distinct(variable_id, .keep_all = TRUE)
+  rank1 <- per_feature %>%
+    dplyr::select(dplyr::any_of(c("variable_id", "evidence", "database_source"))) %>%
+    dplyr::rename_with(~ paste0("top_", .x), -variable_id)
+  object2@variable_info %>%
+    dplyr::select(variable_id, mz, rt) %>%
+    left_join(per_feature %>% dplyr::select(dplyr::any_of(feat_cols)), by = "variable_id") %>%
+    left_join(rank1, by = "variable_id") %>%
+    mutate(
+      feature_level = ifelse(is.na(feature_level), MSI_LEVELS[["L4"]], feature_level),
+      display_name = ifelse(is.na(display_name), variable_id, display_name)
+    )
+}
+
+#' Identified (Level 1-2) features only, one row each, with identified IDs
+#'
+#' For ID-based analyses (MetaboAnalystR MSEA/topology, chemical classes):
+#' accurate-mass candidates must not enter them as if they were identities.
+identified_annotation <- function(app3) {
+  if (is.null(app3) || nrow(app3) == 0 || !"identified_name" %in% colnames(app3)) return(NULL)
+  app3 %>%
+    filter(confidence_level %in% MSI_LEVELS[c("L1", "L2")]) %>%
+    arrange(variable_id, candidate_rank) %>%
+    distinct(variable_id, .keep_all = TRUE) %>%
+    mutate(Compound.name = identified_name, HMDB.ID = identified_hmdb_id,
+           KEGG.ID = identified_kegg_id)
+}
+
+#' variable_id -> display name, for features with a Level 1-3 annotation
+annotated_display_names <- function(app3) {
+  if (is.null(app3) || nrow(app3) == 0 || !"display_name" %in% colnames(app3)) {
+    return(data.frame(variable_id = character(0), display_name = character(0)))
+  }
+  app3 %>%
+    filter(confidence_level %in% MSI_LEVELS[c("L1", "L2", "L3")]) %>%
+    distinct(variable_id, .keep_all = TRUE) %>%
+    dplyr::select(variable_id, display_name)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2047,6 +2957,54 @@ sirius_available_databases <- function(sirius_path) {
   unique(db[nzchar(db)])
 }
 
+#' Is a CSI:FingerID structure hit in one of the searched databases?
+#'
+#' SIRIUS 6 "expansive search" falls back to PubChem when the requested
+#' databases score low, and the fallback hit can still get a high COSMIC
+#' confidence: 0.82-0.85 for a bromo-glucosinolate (Batch2), a decyloxy-pyridine
+#' amide (Batch5) and a lipopeptide (Batch6), none of them in HMDB/ChEBI.
+#' `links` lists the databases holding the structure ("HMDB:(HMDB0000158);
+#' CHEBI:(...)"; "(null)" = flag without IDs).
+#'
+#' @param links `links` column of structure_identifications.tsv
+#' @param databases Requested databases (sirius$structure_db); "BIO" accepts any
+#'   database except PubChem
+#' @return Logical vector
+sirius_in_databases <- function(links, databases) {
+  links <- as.character(links)
+  pat <- if ("BIO" %in% toupper(databases)) {
+    "(^|;)(?!PUBCHEM:)[A-Za-z0-9]+:\\((?!null\\))"
+  } else {
+    sprintf("(?i)(^|;)(%s):\\((?!null\\))", paste(databases, collapse = "|"))
+  }
+  !is.na(links) & grepl(pat, links, perl = TRUE)
+}
+
+#' SIRIUS ion types for the configured MS1 adducts
+#'
+#' With MS2-only MGF input SIRIUS cannot detect adducts and falls back to
+#' [M-H]- alone, so an acetate adduct ([M+CH3COO]-, the main PC ion with
+#' ammonium acetate) got the formula of a non-existent [M-H]- ion. The
+#' annotation adducts are passed as the enforced, detectable and fallback ion
+#' types instead; sirius$adducts overrides them.
+#'
+#' @param cfg Validated config list
+#' @return Character vector in SIRIUS notation, e.g. "[M+C2H4O2-H]-"
+sirius_adduct_list <- function(cfg) {
+  if (!is.null(cfg$sirius$adducts)) return(cfg_values(cfg$sirius$adducts, character(0)))
+  to_sirius <- c("(M-H)-" = "[M-H]-", "(M+CH3COO)-" = "[M+C2H4O2-H]-",
+                 "(M+HCOO)-" = "[M+CH2O2-H]-", "(M+Cl)-" = "[M+Cl]-",
+                 "(M-H2O-H)-" = "[M-H2O-H]-", "(M+H)+" = "[M+H]+",
+                 "(M+Na)+" = "[M+Na]+", "(M+K)+" = "[M+K]+",
+                 "(M+NH4)+" = "[M+NH3+H]+", "(M-H2O+H)+" = "[M+H-H2O]+")
+  ad <- unname(to_sirius[cfg_values(cfg$annotation$ms1_adducts, character(0))])
+  ad <- ad[!is.na(ad)]
+  if (length(ad) == 0) {
+    ad <- if (identical(cfg$feature_extraction$polarity, "positive")) "[M+H]+" else "[M-H]-"
+  }
+  ad
+}
+
 #' Export MS2 spectra to MGF format and optionally run SIRIUS
 #'
 #' SIRIUS is a Java CLI tool for molecular formula prediction and structure
@@ -2093,7 +3051,9 @@ run_sirius_analysis <- function(object, app3, cfg) {
     return(app3)
   }
 
-  # Write MGF file
+  # Write MGF file. The SIRIUS cache below is only valid for the spectra it was
+  # computed from — after an m/z recalibration the MGF changes.
+  old_mgf_md5 <- if (file.exists(mgf_file)) unname(tools::md5sum(mgf_file)) else NA_character_
   con <- file(mgf_file, "w")
   on.exit(close(con), add = TRUE)
 
@@ -2128,7 +3088,10 @@ run_sirius_analysis <- function(object, app3, cfg) {
       n_exported <- n_exported + 1
     }
   }
+  close(con)
+  on.exit()
   cat(sprintf("   Exported %d MS2 spectra to: %s\n", n_exported, mgf_file))
+  mgf_changed <- !is.na(old_mgf_md5) && !identical(old_mgf_md5, unname(tools::md5sum(mgf_file)))
 
   if (n_exported == 0) {
     cat("   No MS2 spectra to export\n")
@@ -2152,6 +3115,24 @@ run_sirius_analysis <- function(object, app3, cfg) {
   # recompute (sirius.recompute_structure) bypasses the cache, because the
   # structure step must run again to pick up a changed database list.
   force_structure <- isTRUE(cfg$sirius$recompute_structure)
+  # The cache is also only valid for the settings it was computed with
+  # (ion types, expansive search off, databases, ppm).
+  sirius_adducts <- sirius_adduct_list(cfg)
+  settings_sig <- paste(c(paste(sirius_adducts, collapse = ","), "expansive_search=OFF",
+                          "bottom_up_constrained",
+                          cfg$sirius$structure_db %||% "HMDB,CHEBI",
+                          as.character(cfg$sirius$ppm_max %||% 15)), collapse = " | ")
+  stamp_file <- file.path(dirname(sirius_output), "pipeline_sirius_settings.txt")
+  old_sig <- if (file.exists(stamp_file)) readLines(stamp_file, warn = FALSE)[1] else NA_character_
+  settings_changed <- !identical(old_sig, settings_sig)
+  if ((mgf_changed || settings_changed) && file.exists(sirius_output)) {
+    stale_dir <- paste0(dirname(sirius_output), ".stale_", format(Sys.time(), "%Y%m%d_%H%M%S"))
+    cat(sprintf("   %s since the cached SIRIUS run;\n   moving the old project to %s and recomputing\n",
+                if (mgf_changed) "MS2 input changed (e.g. m/z recalibration, merged features)"
+                else "SIRIUS settings changed", stale_dir))
+    file.rename(dirname(sirius_output), stale_dir)
+    dir.create(dirname(sirius_output), showWarnings = FALSE, recursive = TRUE)
+  }
   if (file.exists(sirius_output) && !force_structure &&
       length(list.files(summary_dir, pattern = "\\.tsv$")) > 0) {
     cat(sprintf("   Existing SIRIUS project + summaries found: %s\n=> Skipping SIRIUS computation (cached).\n",
@@ -2206,7 +3187,19 @@ run_sirius_analysis <- function(object, app3, cfg) {
     # `-i` (the input MGF) is only needed on the first call that imports the
     # spectra; later tool calls reuse the project's stored features.
     cat(sprintf("   SIRIUS input: %s\n   SIRIUS output: %s\n", mgf_file, sirius_output))
-    sirius_run(c("-i", mgf_file, "formula", "-p", "qtof",
+    # All settings go into this first call: a `config` given to a later call
+    # invalidates the stored formula/fingerprint results, and `structures`
+    # then finds nothing. Bottom-up formula candidates otherwise ignore the
+    # element constraints (F/Si/B formulas for phospholipids).
+    cat(sprintf("   SIRIUS ion types: %s\n", paste(sirius_adducts, collapse = ", ")))
+    adduct_arg <- paste(sirius_adducts, collapse = ",")
+    sirius_run(c("-i", mgf_file, "config",
+                 paste0("--AdductSettings.enforced=", adduct_arg),
+                 paste0("--AdductSettings.fallback=", adduct_arg),
+                 paste0("--AdductSettings.detectable=", adduct_arg),
+                 "--FormulaSearchSettings.applyFormulaConstraintsToBottomUp=true",
+                 "--ExpansiveSearchConfidenceMode.confidenceScoreSimilarityMode=OFF",
+                 "formula", "-p", "qtof",
                  "--ppm-max", as.character(cfg$sirius$ppm_max %||% 15)),
                "formula prediction")
     sirius_run(c("fingerprints"), "fingerprint prediction")
@@ -2244,6 +3237,9 @@ run_sirius_analysis <- function(object, app3, cfg) {
     # SIRIUS preserves already-computed results and skips those instances, so a
     # changed `-d` list silently has NO effect unless the search is forced. Set
     # sirius.recompute_structure=true once after switching databases.
+    # Expansive search (fallback to all of PubChem when HMDB/ChEBI score low)
+    # is switched off in the formula call; sirius_in_databases() still filters
+    # such hits from older projects.
     structure_args <- c("structures", "-d", structure_db)
     if (isTRUE(cfg$sirius$recompute_structure)) {
       structure_args <- c("--recompute", structure_args)
@@ -2252,6 +3248,7 @@ run_sirius_analysis <- function(object, app3, cfg) {
     sirius_run(structure_args,
                sprintf("structure database search [%s]", structure_db))
 
+    writeLines(settings_sig, stamp_file)
     cat(sprintf("   SIRIUS analysis complete. Project saved to: %s\n", sirius_output))
   }
 
@@ -2310,8 +3307,6 @@ run_sirius_analysis <- function(object, app3, cfg) {
       }
       sirius_results$variable_id <- sirius_var_id(as.character(sirius_results[[id_col]]))
 
-      if (is.null(app3) || nrow(app3) == 0) next
-
       merge_kind <- if (grepl("^structure_identifications", basename(sf))) {
         "structure"
       } else if (grepl("^formula_identifications", basename(sf))) {
@@ -2323,6 +3318,15 @@ run_sirius_analysis <- function(object, app3, cfg) {
       }
       if (is.na(merge_kind)) next
 
+      # Features SIRIUS characterised but no library matched would otherwise be
+      # dropped by the left_join below; give them an empty candidate row.
+      if (is.null(app3)) app3 <- data.frame(variable_id = character(0), stringsAsFactors = FALSE)
+      sirius_only <- setdiff(unique(sirius_results$variable_id), app3$variable_id)
+      if (length(sirius_only) > 0) {
+        app3 <- dplyr::bind_rows(app3, data.frame(variable_id = sirius_only,
+                                                  stringsAsFactors = FALSE))
+      }
+
       rank_col <- switch(merge_kind,
                          structure = "structurePerIdRank",
                          formula   = "formulaRank",
@@ -2331,6 +3335,15 @@ run_sirius_analysis <- function(object, app3, cfg) {
         sirius_results <- sirius_results[order(sirius_results$variable_id,
                                                sirius_results[[rank_col]]), , drop = FALSE]
         sirius_results <- sirius_results[!duplicated(sirius_results$variable_id), , drop = FALSE]
+      }
+      if (merge_kind == "structure" && "links" %in% colnames(sirius_results)) {
+        searched <- trimws(strsplit(cfg$sirius$structure_db %||% "HMDB,CHEBI", ",")[[1]])
+        in_db <- sirius_in_databases(sirius_results$links, searched)
+        if (any(!in_db)) {
+          cat(sprintf("   %d SIRIUS structure hit(s) not in %s (expansive-search fallback) dropped\n",
+                      sum(!in_db), paste(searched, collapse = ",")))
+        }
+        sirius_results <- sirius_results[in_db, , drop = FALSE]
       }
 
       sirius_merge <- switch(merge_kind,
@@ -2375,31 +3388,23 @@ run_sirius_analysis <- function(object, app3, cfg) {
       app3 <- app3 %>% left_join(sirius_merge, by = "variable_id")
 
       if (merge_kind == "structure") {
-        n_struct <- sum(!is.na(app3$sirius_name))
-        cat(sprintf("   SIRIUS structure hits merged: %d features with a CSI:FingerID candidate\n",
-                    n_struct))
-        if (n_struct > 0) {
-          # Upgrade Level 3/4 features that now have SIRIUS structure evidence.
-          # A CSI:FingerID structure hit is MSI Level 2 (putatively identified);
-          # a formula-only hit stays Level 3.
-          app3 <- app3 %>%
-            mutate(
-              confidence_level = ifelse(
-                !is.na(.data$sirius_name) &
-                  .data$confidence_level %in% c("Level 3 — Putatively annotated",
-                                                "Level 4 — Unknown"),
-                "Level 2 — Putatively identified",
-                .data$confidence_level
-              )
-            )
-          cat("   Upgraded confidence levels for SIRIUS-validated features\n")
-        }
+        # A CSI:FingerID top hit is not an identification by itself: most hits
+        # here have COSMIC confidence ~0.1 (structures such as "Ohcu"). Only
+        # those reaching sirius$min_structure_confidence name a feature (Level 2,
+        # set in finalize_annotation); the rest keep formula + CANOPUS class.
+        min_conf <- as.numeric(cfg$sirius$min_structure_confidence %||% 0.5)
+        s_feat <- sirius_merge[!is.na(sirius_merge$sirius_name), , drop = FALSE]
+        cat(sprintf("   SIRIUS structure hits merged: %d features, %d with COSMIC confidence >= %.2f\n",
+                    nrow(s_feat),
+                    sum(suppressWarnings(as.numeric(s_feat$sirius_confidence)) >= min_conf,
+                        na.rm = TRUE),
+                    min_conf))
       } else if (merge_kind == "formula") {
         cat(sprintf("   SIRIUS formula hits merged: %d features with a predicted formula\n",
-                    sum(!is.na(app3$sirius_formula))))
+                    sum(!is.na(sirius_merge$sirius_formula))))
       } else {
         cat(sprintf("   CANOPUS class predictions merged: %d features\n",
-                    sum(!is.na(app3$canopus_cf_superclass))))
+                    sum(!is.na(sirius_merge$canopus_cf_superclass))))
       }
     }
   } else {
@@ -2596,11 +3601,12 @@ run_metfrag_analysis <- function(app3, object, cfg) {
 #' Generate comprehensive identification report
 #'
 #' Creates a detailed identification report with:
-#'  - Multi-sheet Excel workbook (Summary, All, per-Level sheets)
-#'  - Per-confidence-level CSV files
-#'  - Text summary with identification statistics
+#'  - Multi-sheet Excel workbook (Summary, Features, All candidates, per-level
+#'    and per-database sheets)
+#'  - Text summary with identification statistics per FEATURE (a feature has
+#'    up to annotation$max_candidates candidate rows)
 #'
-#' @param app3 Merged annotation data.frame with confidence levels
+#' @param app3 Candidate table from finalize_annotation()
 #' @param object mass_dataset object
 #' @param cfg Validated config list
 #' @return Invisible NULL
@@ -2615,65 +3621,26 @@ generate_identification_report <- function(app3, object, cfg) {
     return(invisible(NULL))
   }
 
-  # ── Summary statistics ────────────────────────────────────────────────────
-  # Counts are per FEATURE, not per candidate row: app3 may carry several
-  # candidate annotations for the same variable_id, and row counts (4309 in
-  # an earlier run for 1816 features) massively overstate identification.
-  total_features <- nrow(object@expression_data)
-  app3_feat <- app3 %>% distinct(variable_id, .keep_all = TRUE)
-  n_candidates <- nrow(app3)
-  n_identified <- nrow(app3_feat)
-  n_level1 <- sum(app3_feat$confidence_level == "Level 1 — Confirmed", na.rm = TRUE)
-  n_level2 <- sum(app3_feat$confidence_level == "Level 2 — Putatively identified", na.rm = TRUE)
-  n_level3 <- sum(app3_feat$confidence_level == "Level 3 — Putatively annotated", na.rm = TRUE)
-  n_level4 <- sum(app3_feat$confidence_level == "Level 4 — Unknown", na.rm = TRUE)
-  n_unmatched <- total_features - n_identified
-
-  unique_compounds <- unique(app3$Compound.name[!is.na(app3$Compound.name) &
-                                                  app3$Compound.name != ""])
-
-  # Per-database stats
-  db_stats <- table(app3$database_source, useNA = "ifany")
-
-  # SIRIUS stats (if available; per feature). The base annotation table (app3)
-  # only keeps the MS1/MS2-database hit, so a feature that SIRIUS identified but
-  # no MS1 library matched would be invisible in the report — and the exported
-  # Compound.name would still show the (weaker) library hit. Prefer the SIRIUS
-  # structure hit where one exists, and record its provenance.
-  has_sirius <- "sirius_name" %in% colnames(app3_feat)
-  if (has_sirius) {
-    n_sirius_structure <- sum(!is.na(app3_feat$sirius_name))
-    n_sirius_formula   <- sum(!is.na(app3_feat$sirius_formula))
-    app3_feat$library_compound_name <- app3_feat$Compound.name
-    use_sirius <- !is.na(app3_feat$sirius_name) & nzchar(app3_feat$sirius_name)
-    app3_feat$Compound.name[use_sirius] <- app3_feat$sirius_name[use_sirius]
-    app3_feat$compound_source <- ifelse(use_sirius, "SIRIUS_CSI:FingerID", "MS_library")
-    app3_feat$formula[use_sirius] <- app3_feat$sirius_formula[use_sirius]
-    # Mirror the same preference into the full candidate table so the CSV/Excel
-    # and the web export agree with the summary counts.
-    if ("sirius_name" %in% colnames(app3)) {
-      use_sirius_all <- !is.na(app3$sirius_name) & nzchar(app3$sirius_name)
-      app3$library_compound_name <- app3$Compound.name
-      app3$Compound.name[use_sirius_all] <- app3$sirius_name[use_sirius_all]
-      app3$compound_source <- ifelse(use_sirius_all, "SIRIUS_CSI:FingerID", "MS_library")
-      if (!"formula" %in% colnames(app3)) app3$formula <- NA_character_
-      app3$formula[use_sirius_all] <- app3$sirius_formula[use_sirius_all]
-    }
-  } else {
-    n_sirius_structure <- 0
-    n_sirius_formula <- 0
-  }
-
-  # SIRIUS stats (if available; per feature)
-  n_sirius <- if ("sirius_formula" %in% colnames(app3_feat)) {
-    sum(!is.na(app3_feat$sirius_formula))
+  feat <- feature_annotation_table(app3, object)
+  n_lv <- table(factor(feat$feature_level, levels = MSI_LEVELS))
+  ident <- feat[feat$feature_level %in% MSI_LEVELS[c("L1", "L2")], , drop = FALSE]
+  putative <- feat[feat$feature_level == MSI_LEVELS[["L3"]], , drop = FALSE]
+  n_by_library <- sum(!is.na(ident$identified_source) &
+                        ident$identified_source != "SIRIUS_CSI:FingerID")
+  n_by_sirius <- sum(ident$identified_source %in% "SIRIUS_CSI:FingerID")
+  n_mass <- sum(!is.na(putative$putative_name))
+  n_class_only <- nrow(putative) - n_mass
+  min_conf <- as.numeric(cfg$sirius$min_structure_confidence %||% 0.5)
+  n_sirius_struct <- sum(!is.na(feat$sirius_name))
+  n_sirius_conf <- sum(suppressWarnings(as.numeric(feat$sirius_confidence)) >= min_conf, na.rm = TRUE)
+  n_sirius_formula <- sum(!is.na(feat$sirius_formula))
+  n_metfrag <- if ("metfrag_fragmenter_score" %in% colnames(app3)) {
+    length(unique(app3$variable_id[!is.na(app3$metfrag_fragmenter_score) &
+                                     app3$metfrag_fragmenter_score > 0]))
   } else 0
-
-  # MetFrag stats (if available; per feature)
-  n_metfrag <- if ("metfrag_fragmenter_score" %in% colnames(app3_feat)) {
-    sum(!is.na(app3_feat$metfrag_fragmenter_score) &
-          app3_feat$metfrag_fragmenter_score > 0)
-  } else 0
+  db_stats <- table(app3$database_source[!is.na(app3$evidence)], useNA = "no")
+  qc_file <- file.path(out_dir, "annotation_qc.txt")
+  qc_lines <- if (file.exists(qc_file)) readLines(qc_file) else character(0)
 
   # ── Write text summary ────────────────────────────────────────────────────
   summary_lines <- c(
@@ -2682,24 +3649,32 @@ generate_identification_report <- function(app3, object, cfg) {
     sprintf("  Generated: %s", Sys.time()),
     "============================================",
     "",
-    sprintf("Total MS1 features: %d", total_features),
-    sprintf("Features with identification: %d", n_identified),
-    sprintf("Candidate annotation rows: %d", n_candidates),
-    sprintf("Unmatched features: %d", n_unmatched),
-    sprintf("Unique compound names: %d", length(unique_compounds)),
+    sprintf("Total MS1 features: %d", nrow(feat)),
+    sprintf("Candidate annotation rows: %d (up to %d per feature)", sum(!is.na(app3$evidence)),
+            cfg$annotation$max_candidates %||% 5),
     "",
-    "--- MSI Confidence Level Breakdown ---",
-    sprintf("  Level 1 — Confirmed (MS2 + RT + in-house):  %d", n_level1),
-    sprintf("  Level 2 — Putatively identified (MS2/SIRIUS): %d", n_level2),
-    sprintf("  Level 3 — Putatively annotated (MS1 only):  %d", n_level3),
-    sprintf("  Level 4 — Unknown:                           %d", n_level4),
+    "--- MSI Confidence Level Breakdown (features) ---",
+    sprintf("  Level 1 — Confirmed (MS2 + RT vs standards):   %d", n_lv[[1]]),
+    sprintf("  Level 2 — Putatively identified:               %d", n_lv[[2]]),
+    sprintf("      MS2 spectral-library match:                %d", n_by_library),
+    sprintf("      SIRIUS structure, confidence >= %.2f:       %d", min_conf, n_by_sirius),
+    sprintf("  Level 3 — Putatively annotated:                %d", n_lv[[3]]),
+    sprintf("      accurate-mass candidate(s), no MS2 match:  %d", n_mass),
+    sprintf("      SIRIUS/CANOPUS compound class only:        %d", n_class_only),
+    sprintf("  Level 4 — Unknown:                             %d", n_lv[[4]]),
     "",
-    sprintf("  SIRIUS-validated features: %d", n_sirius),
-    sprintf("    of which CSI:FingerID structure hits: %d", n_sirius_structure),
-    sprintf("    of which formula-only:                 %d", n_sirius_formula),
+    "  Only Level 1-2 features carry a compound name / HMDB / KEGG ID in",
+    "  downstream tables, figures and the web export; Level 3 features are shown",
+    "  as '<candidate>? (<feature id>)'.",
+    "",
+    sprintf("  SIRIUS: %d features with a formula, %d with a CSI:FingerID structure (%d at confidence >= %.2f)",
+            n_sirius_formula, n_sirius_struct, n_sirius_conf, min_conf),
     sprintf("  MetFrag-validated features: %d", n_metfrag),
     "",
-    "--- Per-Database Matches ---",
+    "--- Search space & chance-match estimate ---",
+    if (length(qc_lines) > 0) paste0("  ", qc_lines) else "  (annotation_qc.txt not found)",
+    "",
+    "--- Candidate rows per source ---",
     paste(capture.output(print(db_stats)), collapse = "\n"),
     ""
   )
@@ -2710,52 +3685,47 @@ generate_identification_report <- function(app3, object, cfg) {
   # ── Build multi-sheet Excel report ────────────────────────────────────────
   wb <- createWorkbook()
 
-  # Summary sheet
   addWorksheet(wb, "Summary")
   summary_df <- data.frame(
-    Metric = c("Total MS1 features", "Features identified",
-               "Candidate annotation rows", "Unmatched features",
-               "Unique compound names",
+    Metric = c("Total MS1 features",
                "Level 1 — Confirmed", "Level 2 — Putatively identified",
-               "Level 3 — Putatively annotated", "Level 4 — Unknown",
-               "SIRIUS-validated (formula)", "  of which CSI:FingerID structure",
+               "  L2 via MS2 spectral library", "  L2 via confident SIRIUS structure",
+               "Level 3 — Putatively annotated", "  L3 accurate-mass candidate",
+               "  L3 SIRIUS/CANOPUS class only", "Level 4 — Unknown",
+               "SIRIUS formula", "SIRIUS CSI:FingerID structure",
                "MetFrag-validated"),
-    Value = c(total_features, n_identified, n_candidates, n_unmatched,
-              length(unique_compounds),
-              n_level1, n_level2, n_level3, n_level4,
-              n_sirius, n_sirius_structure, n_metfrag),
+    Value = c(nrow(feat), n_lv[[1]], n_lv[[2]], n_by_library, n_by_sirius,
+              n_lv[[3]], n_mass, n_class_only, n_lv[[4]],
+              n_sirius_formula, n_sirius_struct, n_metfrag),
     stringsAsFactors = FALSE
   )
   writeData(wb, "Summary", summary_df)
 
-  # All identifications sheet
+  # One row per feature (unmatched included)
+  addWorksheet(wb, "Features")
+  writeData(wb, "Features", feat)
+
+  # All candidate rows (refresh_web_export.R rebuilds metabolites.json from it)
   addWorksheet(wb, "All_Identifications")
   writeData(wb, "All_Identifications", app3)
 
   # Per-level sheets
-  for (lvl in unique(app3$confidence_level)) {
+  for (lvl in intersect(MSI_LEVELS, unique(app3$confidence_level))) {
     lvl_short <- gsub(" .*$", "", gsub("Level ", "L", lvl))
-    lvl_data <- app3[app3$confidence_level == lvl, , drop = FALSE]
-    if (nrow(lvl_data) > 0) {
-      addWorksheet(wb, lvl_short)
-      writeData(wb, lvl_short, lvl_data)
-    }
+    addWorksheet(wb, lvl_short)
+    writeData(wb, lvl_short, app3[app3$confidence_level == lvl, , drop = FALSE])
   }
 
   # Per-database sheets
-  for (db_src in unique(app3$database_source)) {
-    db_data <- app3[app3$database_source == db_src, , drop = FALSE]
-    if (nrow(db_data) > 0) {
-      sheet_name <- substr(db_src, 1, 31)  # Excel sheet name limit
-      addWorksheet(wb, sheet_name)
-      writeData(wb, sheet_name, db_data)
-    }
+  for (db_src in sort(unique(stats::na.omit(app3$database_source)))) {
+    sheet_name <- substr(db_src, 1, 31)  # Excel sheet name limit
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, app3[app3$database_source %in% db_src, , drop = FALSE])
   }
 
   saveWorkbook(wb, file.path(out_dir, "Compound_identification_report.xlsx"), overwrite = TRUE)
   cat(sprintf("   Excel report saved: %s\n", file.path(out_dir, "Compound_identification_report.xlsx")))
 
-  # Print summary to console
   for (line in summary_lines) {
     if (nchar(line) > 0) cat(sprintf("   %s\n", line))
   }
@@ -2786,12 +3756,9 @@ run_annotated_volcano <- function(diff_results, app3, cfg) {
   p_col <- if (identical(sig_metric, "adj_p_value")) "adj.P.Val" else "P.Value"
   p_lab <- if (identical(sig_metric, "adj_p_value")) "adj. p-value (FDR)" else "p-value"
 
-  # one annotation per feature (first candidate) — multi-candidate rows in
-  # app3 otherwise duplicate volcano points via the left_join below
-  annot_lookup <- app3 %>%
-    dplyr::select(variable_id, Compound.name) %>%
-    filter(!is.na(Compound.name) & Compound.name != "") %>%
-    distinct(variable_id, .keep_all = TRUE)
+  # one label per feature: the identified name, or "<candidate>? (<id>)" for
+  # accurate-mass-only (Level 3) features — see finalize_annotation()
+  annot_lookup <- annotated_display_names(app3)
 
   for (cmp_name in names(diff_results)) {
     dr <- diff_results[[cmp_name]]
@@ -2804,8 +3771,7 @@ run_annotated_volcano <- function(diff_results, app3, cfg) {
     diff_all$variable_id <- rownames(diff_all)
     diff_all <- diff_all %>%
       left_join(annot_lookup, by = "variable_id") %>%
-      mutate(label = ifelse(is.na(Compound.name) | Compound.name == "",
-                            variable_id, Compound.name))
+      mutate(label = ifelse(is.na(display_name), variable_id, display_name))
 
     diff_all$.plot_p <- diff_all[[p_col]]
     diff_all$Significant <- ifelse(
@@ -2816,7 +3782,7 @@ run_annotated_volcano <- function(diff_results, app3, cfg) {
       filter(Significant != "Not") %>%
       arrange(.plot_p) %>%
       head(20) %>%
-      filter(!is.na(Compound.name) & Compound.name != "") %>%
+      filter(!is.na(display_name)) %>%
       head(5)
 
     p <- ggplot(diff_all, aes(x = logFC, y = -log10(.plot_p))) +
@@ -2848,120 +3814,225 @@ run_annotated_volcano <- function(diff_results, app3, cfg) {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. Step 7: KEGG Pathway Enrichment
+# 10. Step 7: Pathway Enrichment (mummichog on the organism's KEGG pathways)
 # ══════════════════════════════════════════════════════════════════════════════
 
-run_kegg_enrichment <- function(app3, diff_results, cfg) {
-  cat("\n===== Step 7: Pathway enrichment (HMDB/SMPDB; legacy dir name 07_KEGG) =====\n")
+#' One mummichog run (MetaboAnalystR) in a scratch directory
+#'
+#' MetaboAnalystR keeps its state in files in the working directory and reads
+#' the pathway library from there, so each run gets its own temporary dir.
+#' PerformPSEA() attaches plyr and igraph; plyr then masks dplyr::arrange()
+#' (dropping row names) and summarise()/mutate(), which broke later steps — so
+#' whatever the run attaches is detached again.
+#'
+#' @param peaks data.frame(m.z, r.t, p.value, t.score) for ALL features
+#' @return list(pathways = MetaboAnalystR pathway table, matched = matched-compound table)
+run_mummichog <- function(peaks, lib_file, org, polarity, p_cutoff, ppm, n_perm) {
+  lib <- paste0(org, "_kegg")
+  run_dir <- tempfile("mummichog_")
+  dir.create(run_dir)
+  old_wd <- setwd(run_dir)
+  attached_before <- search()
+  on.exit({
+    setwd(old_wd)
+    unlink(run_dir, recursive = TRUE)
+    for (pkg in setdiff(search(), attached_before)) {
+      if (startsWith(pkg, "package:")) try(detach(pkg, character.only = TRUE), silent = TRUE)
+    }
+  }, add = TRUE)
+  file.copy(lib_file, file.path(run_dir, paste0(lib, ".qs")))
+  write.table(peaks, "peaks.txt", sep = "\t", row.names = FALSE, quote = FALSE)
 
-  if (!exists("hmdb_pathway")) {
-    cat("   hmdb_pathway not loaded, skipping KEGG enrichment\n")
-    return(invisible(NULL))
-  }
-  if (is.null(app3) || nrow(app3) == 0) {
-    cat("   No annotations, skipping\n")
-    return(invisible(NULL))
-  }
+  ma <- asNamespace("MetaboAnalystR")
+  set.seed(1)
+  invisible(capture.output(suppressWarnings(suppressMessages({
+    mSet <- ma$InitDataObjects("mass_all", "mummichog", FALSE, default.dpi = 72)
+    mSet <- ma$SetPeakFormat(mSet, "mprt")
+    # force_primary_ion = "yes": a compound counts only if its primary ion
+    # ([M-H]- / [M+H]+) is among the features
+    mSet <- ma$UpdateInstrumentParameters(mSet, ppm, polarity, "yes", 0.02)
+    mSet <- ma$Read.PeakListData(mSet, "peaks.txt")
+    mSet <- ma$SanityCheckMummichogData(mSet)
+    mSet <- ma$SetPeakEnrichMethod(mSet, "mum", "v2")
+    mSet <- ma$SetMummichogPval(mSet, p_cutoff)
+    mSet <- ma$PerformPSEA(mSet, lib, "current", 3, n_perm)
+  }))))
+
+  pw_file <- "mummichog_pathway_enrichment_mummichog.csv"
+  if (!file.exists(pw_file)) stop("mummichog wrote no pathway table")
+  pw <- read.csv(pw_file, check.names = FALSE, stringsAsFactors = FALSE)
+  matched_file <- "mummichog_matched_compound_all.csv"
+  matched <- if (file.exists(matched_file)) read.csv(matched_file, stringsAsFactors = FALSE) else NULL
+  list(pathways = pw, matched = matched)
+}
+
+#' Pathway enrichment with mummichog — no compound IDs needed
+#'
+#' Accurate-mass compound IDs are mostly chance matches (Step 6), so the
+#' enrichment does not use them. mummichog works on the m/z of ALL features:
+#' significant features (same p column and cutoff as Step 4) are matched to the
+#' organism's KEGG compounds as "empirical compounds" (all adduct/isomer
+#' readings of an m/z kept together). The reported p is mummichog's Fisher
+#' exact test of each pathway's significant vs all empirical compounds, with
+#' BH over the tested pathways. Both alternative p-values mummichog offers are
+#' kept but not used: the gamma-modelled p (p_gamma) was < 0.05 for nearly
+#' every pathway tested on Batch1, and the permutation p (p_permutation) is
+#' biased when significant features differ in m/z make-up from the rest —
+#' on Batch5 pathways with Fisher p 0.06-0.08 got permutation p 0.001.
+#' Pathways are those of kegg$organism (mmu = mouse). This replaces the
+#' HMDB/SMPDB ORA, which ran human pathways on the MS1-only HMDB IDs of the old
+#' annotation.
+#'
+#' Outputs in 07_KEGG/ per comparison: mummichog_<cmp>_pathways.csv (every
+#' tested pathway), kegg_pathway_<cmp>.xlsx + dot plot (BH q < kegg$q_value_cutoff;
+#' the xlsx is what the web export reads), and mummichog_summary.csv.
+#'
+#' @param object2 mass_dataset (feature m/z and RT)
+#' @param diff_results Output of run_differential()
+#' @param cfg Validated config list
+run_pathway_enrichment <- function(object2, diff_results, cfg) {
+  kegg_cfg <- cfg$kegg
+  org <- kegg_cfg$organism %||% "mmu"
+  cat(sprintf("\n===== Step 7: Pathway enrichment (mummichog, KEGG %s; dir name 07_KEGG) =====\n", org))
 
   out_dir <- file.path(cfg$project$output_dir, "07_KEGG")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  # Remove every earlier output (incl. the HMDB/SMPDB ORA tables) so the web
+  # export cannot pick up a stale table for a comparison skipped below.
+  unlink(list.files(out_dir, pattern = "^(kegg_pathway_|annotated_|mummichog_)",
+                    full.names = TRUE))
+
+  if (!requireNamespace("MetaboAnalystR", quietly = TRUE)) {
+    cat("   MetaboAnalystR not installed, skipping pathway enrichment\n")
+    return(invisible(NULL))
+  }
+  lib_file <- mummichog_library_file(cfg)
+  if (is.null(lib_file)) {
+    cat("   mummichog pathway library unavailable, skipping pathway enrichment\n")
+    return(invisible(NULL))
+  }
+  lib <- qs::qread(lib_file)
+
+  diff_cfg <- cfg$differential
+  sig_metric <- diff_cfg$significance_metric %||% "p_value"
+  p_col <- if (identical(sig_metric, "adj_p_value")) "adj.P.Val" else "P.Value"
+  alpha <- diff_cfg$p_value_cutoff
+  q_cut <- kegg_cfg$q_value_cutoff %||% 0.05
+  ppm <- kegg_cfg$mummichog_ppm %||% cfg$annotation$ms1_match_ppm
+  n_perm <- kegg_cfg$mummichog_permutations %||% 1000
+  min_sig <- kegg_cfg$mummichog_min_significant %||% 10
+  polarity <- cfg$feature_extraction$polarity
+  db_label <- sprintf("KEGG %s (mummichog v2)", org)
+  cat(sprintf("   Significant features: %s < %g; %g ppm; %d permutations; pathways with BH q < %g reported\n",
+              p_col, alpha, ppm, n_perm, q_cut))
+
+  vi <- object2@variable_info
+  if ("mz_calibrated" %in% colnames(vi) && any(!vi$mz_calibrated)) {
+    # m/z outside the lock-mass range of a drifted batch cannot be matched
+    cat(sprintf("   %d features outside the calibrated m/z range left out\n", sum(!vi$mz_calibrated)))
+    vi <- vi[vi$mz_calibrated, , drop = FALSE]
+  }
+  vi <- vi %>% dplyr::select(variable_id, mz, rt)
+  summary_rows <- list()
 
   for (cmp_name in names(diff_results)) {
     dr <- diff_results[[cmp_name]]
-    if (is.null(dr) || is.null(dr$sig) || nrow(dr$sig) == 0) next
+    if (is.null(dr) || is.null(dr$all)) next
+    label <- dr$comparison$label %||% cmp_name
 
-    label <- dr$comparison$label
-    cat(sprintf("   Enrichment: %s\n", label))
-
-    diff_peaks <- dr$sig
-    diff_peaks$variable_id <- rownames(diff_peaks)
-
-    # one annotation per feature before joining, so a multi-candidate feature
-    # contributes exactly one row (same first candidate as the volcano plots)
-    annotated <- merge(app3 %>% distinct(variable_id, .keep_all = TRUE),
-                       diff_peaks, by = "variable_id") %>%
-      distinct(Compound.name, .keep_all = TRUE)
-    if (nrow(annotated) == 0) {
-      cat("     No annotated matches, skipping\n")
+    tab <- dr$all
+    tab$variable_id <- rownames(tab)
+    tab <- merge(tab, vi, by = "variable_id")
+    peaks <- data.frame(m.z = round(tab$mz, 6), r.t = round(tab$rt, 2),
+                        p.value = tab[[p_col]], t.score = tab$t)
+    peaks <- peaks[!is.na(peaks$p.value) & !is.na(peaks$m.z), , drop = FALSE]
+    n_sig <- sum(peaks$p.value < alpha)
+    if (n_sig < min_sig) {
+      cat(sprintf("   %s: %d significant features (< %d), skipped\n", label, n_sig, min_sig))
+      summary_rows[[cmp_name]] <- data.frame(comparison = cmp_name, n_features = nrow(peaks),
+                                             n_significant = n_sig, n_pathways_tested = NA,
+                                             n_pathways_q = NA, status = "too few significant features")
       next
     }
 
-    write.csv(annotated, file.path(out_dir, paste0("annotated_", cmp_name, ".csv")),
-              row.names = FALSE)
-
-    HMDB_ids <- unique(annotated$HMDB.ID)
-    HMDB_ids <- HMDB_ids[!is.na(HMDB_ids) & HMDB_ids != ""]
-
-    if (length(HMDB_ids) > 0) {
-      result <- tryCatch(
-        enrich_hmdb(
-          query_id = HMDB_ids, query_type = "compound",
-          id_type = "HMDB", pathway_database = hmdb_pathway,
-          only_primary_pathway = TRUE, p_cutoff = 0.99,
-          p_adjust_method = "BH"
-        ),
-        error = function(e) NULL
-      )
-
-      # enrich_hmdb() returns NULL when no pathway is enriched for this query
-      # (and may error on degenerate input), so guard before slot access.
-      if (is.null(result)) {
-        cat("     No enriched pathways for this comparison, skipping\n")
-        next
-      }
-
-      HMDB_pathway <- result@result
-      if (is.null(HMDB_pathway) || nrow(HMDB_pathway) == 0) {
-        cat("     No enriched pathways for this comparison, skipping\n")
-        next
-      }
-      # Filter on BH-adjusted q-values. The tidymass enrich_hmdb result carries
-      # no adjusted column (verified 2026-09-10 batch1 run), so compute BH over
-      # this query's pathways ourselves; use the result's own column if it ever
-      # appears. Cutoff: kegg.q_value_cutoff (default 0.05).
-      path_alpha <- cfg$kegg$q_value_cutoff %||% 0.05
-      adj_col <- NULL
-      for (cc in c("q_value", "p_adjust", "fdr", "p_fdr")) {
-        if (cc %in% colnames(HMDB_pathway)) { adj_col <- cc; break }
-      }
-      if (is.null(adj_col)) {
-        HMDB_pathway$q_value <- p.adjust(HMDB_pathway$p_value, method = "BH")
-        adj_col <- "q_value"
-        cat("     (adjusted-p computed in-pipeline: BH over query pathways)\n")
-      }
-      HMDB_pathway <- HMDB_pathway[HMDB_pathway[[adj_col]] < path_alpha, , drop = FALSE]
-      HMDB_pathway <- arrange(HMDB_pathway, desc(mapped_number))
-
-      if (nrow(HMDB_pathway) > 0) {
-        write.xlsx(HMDB_pathway, file.path(out_dir, paste0("kegg_pathway_", cmp_name, ".xlsx")))
-
-        HMDB_plot <- if (nrow(HMDB_pathway) > 10) HMDB_pathway[1:10, ] else HMDB_pathway
-        HMDB_plot$pathway_name <- factor(HMDB_plot$pathway_name,
-                                         levels = rev(unique(HMDB_plot$pathway_name)))
-
-        p <- ggplot(HMDB_plot, aes(x = mapped_number, y = pathway_name)) +
-          geom_point(aes(size = p_value, color = mapped_number)) +
-          scale_color_gradientn(colours = c("#f7ca64", "#46bac2", "#7e62a3")) +
-          labs(color = "Mapped number", size = "p-value",
-               x = "Count Number", title = label) +
-          theme_bw() +
-          theme(axis.text.y = element_text(size = rel(1.5)),
-                axis.title.x = element_text(size = rel(1.5)),
-                axis.title.y = element_blank(),
-                plot.title = element_text(hjust = 0.5, size = 14)) +
-          scale_size(range = c(5, 10))
-
-        save_plot(file.path(out_dir, paste0("kegg_pathway_", cmp_name)),
-                  plot = p, width = 13, height = 8, dpi = cfg$visualization$dpi)
-        cat(sprintf("     %d significant pathways\n", nrow(HMDB_pathway)))
-      } else {
-        cat("     No significant pathways\n")
-      }
-    } else {
-      cat("     No HMDB IDs for enrichment\n")
+    res <- tryCatch(run_mummichog(peaks, lib_file, org, polarity, alpha, ppm, n_perm),
+                    error = function(e) {
+                      cat(sprintf("   %s: mummichog failed: %s\n", label, conditionMessage(e)))
+                      NULL
+                    })
+    if (is.null(res) || nrow(res$pathways) == 0) {
+      summary_rows[[cmp_name]] <- data.frame(comparison = cmp_name, n_features = nrow(peaks),
+                                             n_significant = n_sig, n_pathways_tested = 0,
+                                             n_pathways_q = 0, status = "no result")
+      next
     }
+
+    pw <- res$pathways
+    pw_tab <- data.frame(
+      pathway_name      = pw[[1]],
+      p_value           = as.numeric(pw[["P(Fisher)"]]),
+      # share of permuted lists with an FET p at least as small
+      p_permutation     = (as.numeric(pw[["Emp.Hits"]]) + 1) / (n_perm + 1),
+      p_gamma           = as.numeric(pw[["P(Gamma)"]]),
+      mapped_number     = as.numeric(pw[["Hits.sig"]]),
+      hits_total        = as.numeric(pw[["Hits.total"]]),
+      background_number = as.numeric(pw[["Pathway total"]]),
+      expected          = as.numeric(pw[["Expected"]]),
+      stringsAsFactors = FALSE
+    )
+    pw_tab$q_value <- p.adjust(pw_tab$p_value, method = "BH")
+
+    # Putative compounds behind each pathway: KEGG compounds matched by the
+    # significant features (accurate mass — candidates, not identifications).
+    sig_cpds <- character(0)
+    if (!is.null(res$matched) && nrow(res$matched) > 0) {
+      sig_key <- paste(peaks$m.z[peaks$p.value < alpha], peaks$r.t[peaks$p.value < alpha])
+      m <- res$matched
+      sig_cpds <- unique(m$Matched.Compound[paste(round(m$Query.Mass, 6),
+                                                  round(m$Retention.Time, 2)) %in% sig_key])
+    }
+    pw_idx <- match(pw_tab$pathway_name, lib$pathways$name)
+    pw_tab$putative_hit_compounds <- vapply(pw_idx, function(i) {
+      if (is.na(i)) return(NA_character_)
+      hits <- intersect(lib$pathways$cpds[[i]], sig_cpds)
+      if (length(hits) == 0) return(NA_character_)
+      paste(lib$cpd.lib$name[match(hits, lib$cpd.lib$id)], collapse = "; ")
+    }, character(1))
+    pw_tab$database <- db_label
+    pw_tab <- pw_tab[order(pw_tab$p_value), , drop = FALSE]
+
+    write.csv(pw_tab, file.path(out_dir, paste0("mummichog_", cmp_name, "_pathways.csv")),
+              row.names = FALSE)
+    sig_pw <- pw_tab[!is.na(pw_tab$q_value) & pw_tab$q_value < q_cut, , drop = FALSE]
+    cat(sprintf("   %s: %d significant features, %d pathways tested, %d with q < %g\n",
+                label, n_sig, nrow(pw_tab), nrow(sig_pw), q_cut))
+    summary_rows[[cmp_name]] <- data.frame(comparison = cmp_name, n_features = nrow(peaks),
+                                           n_significant = n_sig, n_pathways_tested = nrow(pw_tab),
+                                           n_pathways_q = nrow(sig_pw), status = "ok")
+    if (nrow(sig_pw) == 0) next
+
+    write.xlsx(sig_pw, file.path(out_dir, paste0("kegg_pathway_", cmp_name, ".xlsx")))
+    plot_df <- head(sig_pw, 15)
+    plot_df$pathway_name <- factor(plot_df$pathway_name, levels = rev(plot_df$pathway_name))
+    p <- ggplot(plot_df, aes(x = -log10(p_value), y = pathway_name)) +
+      geom_point(aes(size = mapped_number, color = q_value)) +
+      scale_color_gradientn(colours = c("#7e62a3", "#46bac2", "#f7ca64")) +
+      labs(x = "-log10(p, Fisher exact)", color = "q-value (BH)",
+           size = "Significant hits", title = sprintf("%s — %s", label, db_label)) +
+      theme_bw() +
+      theme(axis.text.y = element_text(size = rel(1.3)),
+            axis.title.x = element_text(size = rel(1.3)),
+            axis.title.y = element_blank(),
+            plot.title = element_text(hjust = 0.5, size = 14)) +
+      scale_size(range = c(4, 9))
+    save_plot(file.path(out_dir, paste0("kegg_pathway_", cmp_name)),
+              plot = p, width = 12, height = 7, dpi = cfg$visualization$dpi)
   }
 
+  if (length(summary_rows) > 0) {
+    write.csv(do.call(rbind, summary_rows), file.path(out_dir, "mummichog_summary.csv"),
+              row.names = FALSE)
+  }
   invisible(NULL)
 }
 
@@ -2979,11 +4050,15 @@ run_heatmap <- function(object2, sample_info, app3, diff_results, cfg) {
 
   out_dir <- file.path(cfg$project$output_dir, "08_Heatmap")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  # a comparison skipped below must not keep a heatmap from an earlier run
+  unlink(list.files(out_dir, pattern = "^heatmap_", full.names = TRUE))
   viz_cfg <- cfg$visualization
 
   all_samples <- colnames(object2@expression_data)
   expr_for_merge <- object2@expression_data
   expr_for_merge$variable_id <- rownames(expr_for_merge)
+  # Level 1-3 features with their display names (unique per feature)
+  annot_lookup <- annotated_display_names(app3)
 
   for (cmp_name in names(diff_results)) {
     dr <- diff_results[[cmp_name]]
@@ -2992,10 +4067,7 @@ run_heatmap <- function(object2, sample_info, app3, diff_results, cfg) {
     diff_peaks <- dr$sig
     diff_peaks$variable_id <- rownames(diff_peaks)
 
-    # one annotation per feature before joining (see KEGG step for rationale)
-    annotated <- merge(app3 %>% distinct(variable_id, .keep_all = TRUE),
-                       diff_peaks, by = "variable_id") %>%
-      distinct(Compound.name, .keep_all = TRUE)
+    annotated <- merge(annot_lookup, diff_peaks, by = "variable_id")
     if (nrow(annotated) == 0) next
 
     annotated <- merge(annotated, expr_for_merge, by = "variable_id")
@@ -3015,7 +4087,7 @@ run_heatmap <- function(object2, sample_info, app3, diff_results, cfg) {
     if (length(core_cols) < 2) next
 
     heat_data <- annotated_top[, core_cols, drop = FALSE]
-    rownames(heat_data) <- annotated_top$Compound.name
+    rownames(heat_data) <- annotated_top$display_name
     heat_data <- heat_data[rowSums(is.na(heat_data)) < ncol(heat_data), , drop = FALSE]
     if (nrow(heat_data) < 2) next
 
@@ -3082,45 +4154,29 @@ run_boxplot <- function(object2, sample_info, app3, diff_results, cfg) {
 
   out_dir <- file.path(cfg$project$output_dir, "09_Boxplot")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  # file names derive from the label, so a renamed feature would otherwise
+  # leave its old plot behind
+  unlink(list.files(out_dir, pattern = "^boxplot_", full.names = TRUE))
   viz_cfg <- cfg$visualization
 
   all_samples <- colnames(object2@expression_data)
   core_group_vec <- sample_info$class[match(all_samples, sample_info$sample_id)]
-
   expre <- object2@expression_data
-  expre$variable_id <- rownames(expre)
-  app3_expr <- left_join(app3, expre, by = "variable_id")
 
   # Collect top-N metabolites from all comparisons
   metabolite_set <- character(0)
   for (cmp_name in names(diff_results)) {
     dr <- diff_results[[cmp_name]]
     if (is.null(dr) || is.null(dr$sig) || nrow(dr$sig) == 0) next
-    top_sig <- dr$sig %>%
-      arrange(P.Value) %>%
-      head(5)
-    metabolite_set <- c(metabolite_set, rownames(top_sig))
+    metabolite_set <- c(metabolite_set, head(rownames(dr$sig)[order(dr$sig$P.Value)], 5))
   }
   metabolite_set <- unique(metabolite_set)
 
-  # Deduplicate by compound name
+  # Level 1-3 features only; display names are unique per feature
+  name_map <- annotated_display_names(app3)
+  metabolite_set <- metabolite_set[metabolite_set %in% name_map$variable_id]
   if (length(metabolite_set) > 0) {
-    name_map <- app3 %>%
-      filter(!is.na(Compound.name) & Compound.name != "") %>%
-      dplyr::select(variable_id, Compound.name) %>%
-      distinct(Compound.name, .keep_all = TRUE)
-
-    has_name <- metabolite_set %in% name_map$variable_id
-    named_vars <- metabolite_set[has_name]
-    unnamed_vars <- metabolite_set[!has_name]
-
-    named_dedup <- name_map %>%
-      filter(variable_id %in% named_vars) %>%
-      distinct(Compound.name, .keep_all = TRUE) %>%
-      pull(variable_id)
-
-    plot_metabolites <- unique(c(named_dedup, unnamed_vars))
-    plot_metabolites <- head(plot_metabolites, viz_cfg$boxplot_top_n)
+    plot_metabolites <- head(metabolite_set, viz_cfg$boxplot_top_n)
     cat(sprintf("   Drawing %d metabolite boxplots\n", length(plot_metabolites)))
 
     # Color map
@@ -3137,14 +4193,10 @@ run_boxplot <- function(object2, sample_info, app3, diff_results, cfg) {
     viz_labels <- cfg$visualization$group_labels
 
     for (vid in plot_metabolites) {
-      meta_row <- app3_expr[app3_expr$variable_id == vid, ]
-      if (nrow(meta_row) == 0) next
+      if (!vid %in% rownames(expre)) next
+      compound_name <- name_map$display_name[match(vid, name_map$variable_id)]
 
-      compound_name <- ifelse(
-        !is.na(meta_row$Compound.name[1]) && meta_row$Compound.name[1] != "",
-        meta_row$Compound.name[1], vid)
-
-      box_values <- as.numeric(meta_row[1, all_samples])
+      box_values <- as.numeric(expre[vid, all_samples])
       box_df <- data.frame(
         value = box_values,
         group = core_group_vec,
@@ -3174,7 +4226,7 @@ run_boxplot <- function(object2, sample_info, app3, diff_results, cfg) {
               aspect.ratio = 1,
               plot.title = element_text(hjust = 0.5, size = 12))
 
-      save_plot(file.path(out_dir, paste0("boxplot_", gsub("[^A-Za-z0-9]", "_", compound_name))),
+      save_plot(file.path(out_dir, paste0("boxplot_", substr(gsub("[^A-Za-z0-9]", "_", compound_name), 1, 100))),
                 plot = p, width = 8, height = 7, dpi = viz_cfg$dpi)
     }
     cat("   Boxplots complete\n")
@@ -3214,7 +4266,8 @@ resolve_module_path <- function(filename) {
 #' OPLS-DA analysis (Step 3.5) and annotation update (Step 6.5).
 #'
 #' @param cfg Validated configuration list from load_and_validate_config()
-main <- function(cfg, qualitative_only = FALSE) {
+main <- function(cfg, qualitative_only = FALSE, reuse_oplsda = FALSE,
+                 reuse_pathways = FALSE) {
   cat("\n========================================\n")
   cat(sprintf("  Metabolomics Pipeline: %s\n", cfg$project$name))
   if (qualitative_only) {
@@ -3298,8 +4351,15 @@ main <- function(cfg, qualitative_only = FALSE) {
   cat(sprintf("=> Saved normalized expression matrix: %s\n", basename(expr_out)))
 
   # ── Step 3.5: OPLS-DA ─────────────────────────────────────────────────
+  oplsda_models <- list.files(file.path(out_root, "03.5_OPLSDA"),
+                              pattern = "_oplsda_model\\.rds$")
   if (qualitative_only) {
     cat("\n===== Step 3.5: OPLS-DA SKIPPED (qualitative-only) =====\n")
+  } else if (reuse_oplsda && length(oplsda_models) > 0) {
+    # Steps 1-5 are deterministic on the cached peak table, so the saved models
+    # still describe this matrix; Step 6.5 re-labels them with the new annotation.
+    cat(sprintf("\n===== Step 3.5: OPLS-DA reused (--reuse-oplsda): %d saved models =====\n",
+                length(oplsda_models)))
   } else if (isTRUE(cfg$oplsda$enabled) && exists("run_oplsda_analysis")) {
     # Filter to subset if specified
     oplsda_comps <- comparisons
@@ -3354,17 +4414,25 @@ main <- function(cfg, qualitative_only = FALSE) {
   # ── Step 6a: CAMERA adduct/isotope grouping (optional) ─────────────────
   run_camera_annotation(object2, cfg)
 
-  # ── Step 6: Multi-database annotation + MSI confidence ─────────────────
+  # ── Step 6: Annotation (MS2 libraries + endogenous accurate mass) ───────
   # Kept in qualitative-only mode: matching is on the m/z axis, which depends
   # on mass calibration rather than on signal intensity, so a sensitivity-
-  # degraded batch still yields meaningful putative annotations.
-  app3 <- run_annotation(object2, cfg)
+  # degraded batch still yields meaningful putative annotations. The m/z axis
+  # is checked (and if drifted, recalibrated) against lock-mass ions first;
+  # everything downstream — pathways, web export — uses the corrected m/z.
+  naming <- build_endogenous_naming_db(cfg)
+  object2 <- recalibrate_mz(object2, cfg)$object2
+  object2@variable_info$isotope_of <- find_c13_isotopes(object2)
+  app3 <- run_annotation(object2, cfg, naming)
 
   # ── Step 6b: SIRIUS formula/structure prediction (optional) ────────────
   app3 <- run_sirius_analysis(object2, app3, cfg)
 
   # ── Step 6c: MetFrag in silico validation (optional) ───────────────────
   app3 <- run_metfrag_analysis(app3, object2, cfg)
+
+  # ── Step 6e: Feature-level MSI levels + display names ──────────────────
+  app3 <- finalize_annotation(app3, object2, cfg, naming$hmdb_formula)
 
   # ── Step 6d: Identification report ─────────────────────────────────────
   generate_identification_report(app3, object2, cfg)
@@ -3387,11 +4455,14 @@ main <- function(cfg, qualitative_only = FALSE) {
     )
   }
 
-  # ── Step 7: KEGG enrichment ───────────────────────────────────────────
+  # ── Step 7: Pathway enrichment (mummichog, KEGG of cfg$kegg$organism) ──
   if (qualitative_only || length(diff_results) == 0) {
-    cat("===== Step 7: KEGG enrichment SKIPPED (no differential results) =====\n")
+    cat("===== Step 7: Pathway enrichment SKIPPED (no differential results) =====\n")
+  } else if (reuse_pathways &&
+             file.exists(file.path(cfg$project$output_dir, "07_KEGG", "mummichog_summary.csv"))) {
+    cat("\n===== Step 7: Pathway enrichment reused (--reuse-pathways): 07_KEGG kept =====\n")
   } else {
-    run_kegg_enrichment(app3, diff_results, cfg)
+    run_pathway_enrichment(object2, diff_results, cfg)
   }
 
   # ── Step 10: MetaboAnalystR Advanced Analysis ─────────────────────────
@@ -3402,7 +4473,14 @@ main <- function(cfg, qualitative_only = FALSE) {
     ma_source <- resolve_module_path("metaboanalyst_advanced.R")
     if (file.exists(ma_source)) {
       source(ma_source)
+      # The ORA uses identified (Level 1-2) compounds only; the class
+      # enrichment needs every feature's class. Packages a module attaches
+      # (plyr masks dplyr's arrange()/summarise()) are detached afterwards.
+      attached_before <- search()
       run_metaboanalyst_advanced(object2, sample_info, diff_results, app3, cfg)
+      for (pkg in setdiff(search(), attached_before)) {
+        if (startsWith(pkg, "package:")) try(detach(pkg, character.only = TRUE), silent = TRUE)
+      }
     } else {
       cat(sprintf("⚠️  MetaboAnalystR module not found at %s, skipping Step 10\n",
                   ma_source))
@@ -3469,13 +4547,16 @@ main <- function(cfg, qualitative_only = FALSE) {
   cat("  ├── 04_Differential/              - Volcano + differential peak tables\n")
   cat("  ├── 05_Overlap/                   - Venn/UpSet overlap analysis\n")
   cat("  ├── 06_Annotation/                - Metabolite annotation + ID report\n")
-  cat("  │   ├── all_annotated_metabolites.csv\n")
-  cat("  │   ├── annotations_L[1-3].csv    - Per-confidence-level annotations\n")
+  cat("  │   ├── all_annotated_metabolites.csv - ranked candidates per feature\n")
+  cat("  │   ├── feature_annotation.csv    - one row per feature (level, names)\n")
+  cat("  │   ├── annotations_L[1-4].csv    - Per-confidence-level annotations\n")
+  cat("  │   ├── annotation_qc.txt         - search space + chance-match estimate\n")
   cat("  │   ├── unmatched_features.csv\n")
   cat("  │   ├── identification_summary.txt\n")
   cat("  │   └── Compound_identification_report.xlsx\n")
   cat("  ├── 06.5_OPLSDA_annotated/        - Annotated OPLS-DA S-plots\n")
-  cat("  ├── 07_KEGG/                      - Pathway enrichment (HMDB/SMPDB)\n")
+  cat(sprintf("  ├── 07_KEGG/                      - Pathway enrichment (mummichog, KEGG %s)\n",
+              cfg$kegg$organism %||% "mmu"))
   cat("  ├── 10_MetaboAnalystR_Advanced/   - MSEA, topology, biomarker, chem class\n")
   cat("  │   ├── MSEA/                     - Metabolite Set Enrichment (GlobalTest)\n")
   cat("  │   ├── Pathway_Topology/         - KEGG topology (RBC/Impact)\n")
@@ -3515,5 +4596,7 @@ if (sys.nframe() == 0) {
     quit(save = "no", status = 0)
   }
 
-  main(cfg, qualitative_only = isTRUE(opt$qualitative_only))
+  main(cfg, qualitative_only = isTRUE(opt$qualitative_only),
+       reuse_oplsda = isTRUE(opt$reuse_oplsda),
+       reuse_pathways = isTRUE(opt$reuse_pathways))
 }

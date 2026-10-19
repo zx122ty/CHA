@@ -18,7 +18,8 @@
 #   pathway_topology_{cmp}.json    — MetaboAnalystR topology results (if available)
 #   biomarker_{cmp}.json   — MetaboAnalystR biomarker results (if available)
 #   chem_class_{cmp}.json  — MetaboAnalystR chemical class enrichment (if available)
-#   metabolites.json       — All annotated metabolites with IDs
+#   metabolites.json       — Annotated features (MSI Level 1-3) with names/IDs
+#   features.json          — Every feature (unknowns included), same record format
 #   expression_{cmp}.json  — Expression matrix for heatmap/boxplot
 #
 # Usage:
@@ -127,7 +128,10 @@ build_manifest <- function(cfg, diff_results, comparisons,
     n_features           = qc_quality$n_features %||% NA_integer_,
     qc_rsd_median        = qc_quality$qc_rsd_median %||% NA_real_,
     qc_rsd_pass_rate     = qc_quality$qc_rsd_pass_rate %||% NA_real_,
-    qc_qc_correlation    = qc_quality$qc_qc_correlation %||% NA_real_
+    qc_qc_correlation    = qc_quality$qc_qc_correlation %||% NA_real_,
+    # FALSE = no process blanks in the metadata: background ions not removed
+    blank_filter_applied = isTRUE(qc_quality$blank_filter_applied),
+    n_blank_samples      = qc_quality$n_blank_samples %||% NA_integer_
   )
 
   list(
@@ -152,6 +156,7 @@ build_manifest <- function(cfg, diff_results, comparisons,
     file_index = list(
       manifest             = "manifest.json",
       metabolites          = "metabolites.json",
+      features             = "features.json",
       pca_scores           = "pca_scores.json",
       volcano_pattern      = "volcano_{cmp}.json",
       pathway_pattern      = "pathway_enrichment_{cmp}.json",
@@ -171,7 +176,10 @@ build_manifest <- function(cfg, diff_results, comparisons,
 #' Export volcano plot data for a single comparison
 #'
 #' Returns an ECharts-friendly array of points:
-#'   {name, logFC, negLog10P, p_value, fdr, group, significance, vip_score, compound_name, hmdb_id, kegg_id}
+#'   {name, logFC, negLog10P, p_value, fdr, group, significance, vip_score,
+#'    compound_name, display_name, msi_level, hmdb_id, kegg_id}
+#' compound_name/IDs only for identified (Level 1-2) features; display_name
+#' also labels accurate-mass candidates ("Uridine? (M243T122_NEG)").
 #'
 #' @param cmp_name Comparison name (e.g., "10_vs_CT1")
 #' @param dr Differential result list from run_differential()
@@ -191,17 +199,18 @@ build_volcano_json <- function(cmp_name, dr, app3, cfg) {
   sig_metric <- cfg$differential$significance_metric %||% "p_value"
   p_col <- if (identical(sig_metric, "adj_p_value")) "adj.P.Val" else "P.Value"
 
-  # Build annotation lookup
+  # Build annotation lookup: one entry per feature (feature-level columns from
+  # finalize_annotation; names/IDs only for identified Level 1-2 features)
   annot_lookup <- list()
-  if (!is.null(app3) && nrow(app3) > 0) {
-    for (i in seq_len(nrow(app3))) {
-      vid <- as.character(app3$variable_id[i])
-      annot_lookup[[vid]] <- list(
-        compound_name = if (!is.null(app3$Compound.name[i]) && !is.na(app3$Compound.name[i]) && app3$Compound.name[i] != "") app3$Compound.name[i] else NA,
-        hmdb_id = if (!is.null(app3$HMDB.ID[i]) && !is.na(app3$HMDB.ID[i]) && app3$HMDB.ID[i] != "") app3$HMDB.ID[i] else NA,
-        kegg_id = if (!is.null(app3$KEGG.ID[i]) && !is.na(app3$KEGG.ID[i]) && app3$KEGG.ID[i] != "") app3$KEGG.ID[i] else NA
-      )
-    }
+  feat <- feature_level_rows(app3)
+  for (i in seq_len(nrow(feat))) {
+    annot_lookup[[as.character(feat$variable_id[i])]] <- list(
+      compound_name = feat$identified_name[i],
+      display_name = feat$display_name[i],
+      hmdb_id = feat$identified_hmdb_id[i],
+      kegg_id = feat$identified_kegg_id[i],
+      msi_level = feat$confidence_level[i]
+    )
   }
 
   # Build points array
@@ -226,7 +235,8 @@ build_volcano_json <- function(cmp_name, dr, app3, cfg) {
     vip <- if (!is.null(dr$vip_scores) && vid %in% names(dr$vip_scores)) dr$vip_scores[[vid]] else NA
 
     # Annotation
-    ann <- annot_lookup[[vid]] %||% list(compound_name = NA, hmdb_id = NA, kegg_id = NA)
+    ann <- annot_lookup[[vid]] %||% list(compound_name = NA, display_name = NA,
+                                         hmdb_id = NA, kegg_id = NA, msi_level = NA)
 
     point <- list(
       name = vid,
@@ -238,6 +248,8 @@ build_volcano_json <- function(cmp_name, dr, app3, cfg) {
       significance = if (is_sig) "significant" else "not_significant",
       vip_score = if (!is.na(vip)) round(vip, 4) else NA,
       compound_name = ann$compound_name,
+      display_name = ann$display_name,
+      msi_level = ann$msi_level,
       hmdb_id = ann$hmdb_id,
       kegg_id = ann$kegg_id
     )
@@ -427,6 +439,8 @@ build_pathway_json <- function(cmp_name, kegg_dir) {
             if ("Background" %in% colnames(pathway_df)) "Background" else NULL
   impact_col <- if ("impact_score" %in% colnames(pathway_df)) "impact_score" else
                 if ("Impact" %in% colnames(pathway_df)) "Impact" else NULL
+  q_col <- if ("q_value" %in% colnames(pathway_df)) "q_value" else NULL
+  hits_col <- if ("putative_hit_compounds" %in% colnames(pathway_df)) "putative_hit_compounds" else NULL
 
   if (is.null(p_name_col) || is.null(p_val_col)) {
     return(list(comparison = cmp_name, pathways = list(), n_pathways = 0))
@@ -446,7 +460,9 @@ build_pathway_json <- function(cmp_name, kegg_dir) {
       neg_log10_p = round(neg_log10, 4),
       mapped_count = if (!is.na(mapped)) mapped else 0,
       background_count = if (!is.na(bg)) bg else 0,
-      impact_score = if (!is.na(impact)) round(impact, 4) else NA
+      impact_score = if (!is.na(impact)) round(impact, 4) else NA,
+      q_value = if (!is.null(q_col)) format(as.numeric(pathway_df[[q_col]][i]), scientific = TRUE) else NA,
+      putative_hit_compounds = if (!is.null(hits_col)) as.character(pathway_df[[hits_col]][i]) else NA
     )
   }
 
@@ -457,9 +473,9 @@ build_pathway_json <- function(cmp_name, kegg_dir) {
 
   list(
     comparison = cmp_name,
-    # The tidymass step runs enrich_hmdb() against the HMDB/SMPDB pathway
-    # collection — the "KEGG" folder/file naming is a legacy label only.
-    database = "HMDB/SMPDB",
+    # Step 7 writes mummichog results on the organism's KEGG pathways and
+    # names the library in a `database` column.
+    database = if ("database" %in% colnames(pathway_df)) as.character(pathway_df$database[1]) else "KEGG (mummichog)",
     n_pathways = length(pathways),
     pathways = pathways
   )
@@ -469,111 +485,182 @@ build_pathway_json <- function(cmp_name, kegg_dir) {
 # 5. Metabolites JSON — master metabolite reference table
 # ══════════════════════════════════════════════════════════════════════════════
 
-#' Export all annotated metabolites as a reference table
+#' One row per feature with the feature-level annotation columns
 #'
-#' Each metabolite gets a unique key (variable_id) and carries
-#' HMDB ID, KEGG ID, compound name, formula, m/z, RT, super class.
+#' finalize_annotation() puts the feature's MSI level, identified name/IDs and
+#' display name on every candidate row; this keeps the rank-1 row. Tables from
+#' before that step (no `identified_name`) get the same columns derived from
+#' the first row: a name only for Level 1-2 features.
 #'
-#' Build the metabolites.json payload
+#' @param app3 Candidate table (possibly several rows per feature)
+#' @return data.frame, one row per variable_id
+feature_level_rows <- function(app3) {
+  if (is.null(app3) || nrow(app3) == 0) return(data.frame(variable_id = character(0)))
+  ord <- if ("candidate_rank" %in% colnames(app3)) order(app3$variable_id, app3$candidate_rank) else seq_len(nrow(app3))
+  feat <- app3[ord, , drop = FALSE]
+  feat <- feat[!duplicated(feat$variable_id), , drop = FALSE]
+  blank <- function(x) { x <- as.character(x); x[!is.na(x) & !nzchar(x)] <- NA; x }
+  if (!"identified_name" %in% colnames(feat)) {
+    ident <- !is.na(feat$confidence_level) & grepl("Level [12]", feat$confidence_level)
+    feat$identified_name <- ifelse(ident, blank(feat$Compound.name), NA)
+    feat$identified_hmdb_id <- ifelse(ident, blank(feat$HMDB.ID), NA)
+    feat$identified_kegg_id <- ifelse(ident, blank(feat$KEGG.ID), NA)
+    feat$identified_source <- ifelse(ident, blank(feat$database_source), NA)
+    feat$putative_name <- ifelse(ident, NA, blank(feat$Compound.name))
+    feat$display_name <- ifelse(ident, feat$identified_name,
+                                ifelse(is.na(feat$putative_name), feat$variable_id,
+                                       paste0(feat$putative_name, "? (", feat$variable_id, ")")))
+  }
+  for (col in c("identified_name", "identified_hmdb_id", "identified_kegg_id",
+                "identified_source", "putative_name", "display_name")) {
+    feat[[col]] <- blank(feat[[col]])
+  }
+  feat$display_name <- ifelse(is.na(feat$display_name), as.character(feat$variable_id), feat$display_name)
+  feat
+}
+
+#' One metabolites.json / features.json record from a feature-level row
 #'
-#' Emits the standard annotation contract: every record carries an identifier
-#' (`inchikey`), the adduct it was matched as, its MSI level, the engine that
-#' produced it (`source`), and a confidence `score` — so downstream consumers do
-#' not have to know which annotation tool ran.
+#' `compound_name`, `hmdb_id` and `kegg_id` are set for identified features
+#' only (MSI Level 1-2: MS2 spectral-library match or a confident SIRIUS
+#' structure). A Level 3 feature — accurate-mass candidate or compound class
+#' only — has them empty: an m/z match alone does not identify a compound
+#' (roughly half of such matches are expected by chance; see
+#' 06_Annotation/annotation_qc.txt). Its candidate is in `putative_*`, and
+#' `display_name` labels every feature, e.g. "Uridine? (M243T122_NEG)".
 #'
-#' @param app3 Annotation table from run_annotation() (optionally enriched by
-#'   run_sirius_analysis() / run_metfrag_analysis())
-#' @param object2 mass_dataset (for expression data)
+#' @param row One-row data.frame from feature_level_rows() (or a bare feature)
+#' @return Named list
+metabolite_record <- function(row) {
+  # Safe scalar getter: returns NA when the column is absent, NULL or blank.
+  pick <- function(col) {
+    if (!col %in% colnames(row)) return(NA)
+    v <- row[[col]]
+    if (is.null(v) || length(v) == 0 || is.na(v[1]) || identical(as.character(v[1]), "")) return(NA)
+    v[1]
+  }
+  level <- pick("confidence_level")
+  if (is.na(level)) level <- "Level 4 — Unknown"
+  identified <- grepl("Level [12]", level)
+  source <- pick("identified_source")
+  by_sirius <- identical(as.character(source), "SIRIUS_CSI:FingerID")
+  is_ms1 <- identical(as.character(pick("evidence")), "MS1_endogenous")
+  if (is.na(source) && !is.na(pick("putative_name"))) source <- "MS1_endogenous"
+
+  # Formula of the identification only: the library compound's, or SIRIUS's
+  # for a SIRIUS-named feature. SIRIUS's own formula stays in sirius_formula
+  # (from MS2 alone it is often wrong for lipids); an accurate-mass
+  # candidate's formula is in putative_formula.
+  formula <- if (identified) pick("identified_formula") else NA
+  if (identified && is.na(formula)) formula <- if (by_sirius) pick("sirius_formula") else pick("Formula")
+
+  # Score of the rank-1 evidence: spectral similarity for MS2 hits, the
+  # composite / m/z score otherwise, else the SIRIUS formula score.
+  score <- pick("SS")
+  if (is.na(score)) score <- pick("Total.score")
+  if (is.na(score)) score <- pick("sirius_formula_score")
+
+  display <- pick("display_name")
+  if (is.na(display)) display <- as.character(row$variable_id)
+  list(
+    variable_id = as.character(row$variable_id),
+    compound_name = if (identified) pick("identified_name") else NA,
+    display_name = display,
+    # ── standard annotation contract ──────────────────────────────────────
+    inchikey = if (by_sirius) pick("sirius_InChIkey") else NA,
+    smiles = if (by_sirius) pick("sirius_smiles") else NA,
+    formula = formula,
+    adduct = pick("Adduct"),
+    msi_level = level,
+    source = source,
+    score = if (is.na(score)) NA else round(as.numeric(score), 4),
+    # ── accurate-mass candidate (Level 3: not an identification) ───────────
+    putative_name = pick("putative_name"),
+    putative_hmdb_id = pick("putative_hmdb_id"),
+    putative_kegg_id = pick("putative_kegg_id"),
+    putative_formula = if (is_ms1) pick("Formula") else NA,
+    n_mass_candidates = pick("n_mass_candidates"),
+    # ── provenance ──────────────────────────────────────────────────────────
+    library_compound_name = if (!is_ms1 && !by_sirius) pick("Compound.name") else NA,
+    sirius_name = pick("sirius_name"),
+    sirius_confidence = pick("sirius_confidence"),
+    sirius_formula = pick("sirius_formula"),
+    canopus_class = pick("canopus_cf_class"),
+    canopus_superclass = pick("canopus_cf_superclass"),
+    hmdb_id = if (identified) pick("identified_hmdb_id") else NA,
+    kegg_id = if (identified) pick("identified_kegg_id") else NA,
+    mz = if (!is.na(pick("mz"))) round(as.numeric(row$mz), 6) else NA,
+    mz_raw = if (!is.na(pick("mz_raw"))) round(as.numeric(row$mz_raw), 6) else NA,
+    rt = if (!is.na(pick("rt"))) round(as.numeric(row$rt), 2) else NA,
+    database_source = pick("database_source"),
+    match_type = pick("match_type"),
+    confidence_level = level
+  )
+}
+
+#' Build the metabolites.json payload — one record per annotated feature
+#'
+#' Annotated = MSI Level 1-3 (see metabolite_record() for what each level
+#' carries). Unknown (Level 4) features are listed in features.json only.
+#'
+#' @param app3 Candidate table from finalize_annotation() (or the
+#'   "All_Identifications" sheet of the identification report)
+#' @param object2 mass_dataset (supplies mz_raw when m/z was recalibrated; may be NULL)
 #' @return List of metabolite records
 build_metabolites_json <- function(app3, object2) {
   if (is.null(app3) || nrow(app3) == 0) {
     return(list(metabolites = list(), n_metabolites = 0))
   }
-
-  # Deduplicate by variable_id (keep first annotation for each feature)
-  app3_dedup <- app3 %>%
-    group_by(variable_id) %>%
-    slice(1) %>%
-    ungroup()
-
-  # `%||%` is defined in metabolomics_pipeline.R; standalone callers may not
-  # have it in scope.
-  if (!exists("%||%", mode = "function")) {
-    `%||%` <<- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[1])) b else a
+  feat <- feature_level_rows(app3)
+  feat <- feat[grepl("Level [123]", feat$confidence_level), , drop = FALSE]
+  if (!is.null(object2) && "mz_raw" %in% colnames(object2@variable_info)) {
+    feat$mz_raw <- object2@variable_info$mz_raw[match(feat$variable_id, object2@variable_info$variable_id)]
   }
-
-  # Safe scalar getter: returns NA when the column is absent, NULL or blank.
-  pick <- function(row, col) {
-    if (is.null(col) || !col %in% colnames(row)) return(NA)
-    v <- row[[col]]
-    if (is.null(v) || length(v) == 0 || is.na(v[1]) || identical(as.character(v[1]), "")) return(NA)
-    v[1]
-  }
-
-  metabolites <- list()
-  for (i in seq_len(nrow(app3_dedup))) {
-    row <- app3_dedup[i, ]
-    vid <- as.character(row$variable_id)
-
-    # Prefer a SIRIUS CSI:FingerID structure hit when present (it is what the
-    # identification report promotes to Level 2); fall back to the library hit.
-    sirius_name    <- pick(row, "sirius_name")
-    library_name   <- pick(row, "library_compound_name")
-    library_name   <- if (is.na(library_name)) pick(row, "Compound.name") else library_name
-    compound_name  <- if (!is.na(sirius_name)) sirius_name else library_name
-
-    # Formula: SIRIUS predicts it even when no MS1 library hit carries one.
-    formula <- pick(row, "formula")
-    if (is.na(formula)) formula <- pick(row, "sirius_formula")
-    if (is.na(formula)) formula <- pick(row, "Formula")
-
-    # Confidence score: prefer the spectral score (SS) for MS2 hits, else the
-    # composite score, else the SIRIUS formula score.
-    score <- pick(row, "SS")
-    if (is.na(score)) score <- pick(row, "Total.score")
-    if (is.na(score)) score <- pick(row, "sirius_formula_score")
-
-    source <- pick(row, "compound_source")
-    if (is.na(source)) {
-      # `compound_source` is only set by generate_identification_report(); when
-      # the export runs off the pre-report table, derive provenance from what
-      # actually supplied the name — otherwise a SIRIUS-named compound would be
-      # attributed to whichever MS1 library happened to match its m/z.
-      source <- if (!is.na(sirius_name)) "SIRIUS_CSI:FingerID" else pick(row, "database_source")
-    }
-
-    metabolites[[i]] <- list(
-      variable_id = vid,
-      compound_name = compound_name,
-      # ── standard annotation contract ──────────────────────────────────────
-      inchikey = pick(row, "sirius_InChIkey"),
-      smiles = pick(row, "sirius_smiles"),
-      formula = formula,
-      adduct = pick(row, "Adduct"),
-      msi_level = pick(row, "confidence_level"),
-      source = source,
-      score = if (is.na(score)) NA else round(as.numeric(score), 4),
-      # ── provenance ────────────────────────────────────────────────────────
-      library_compound_name = library_name,
-      sirius_name = sirius_name,
-      canopus_class = pick(row, "canopus_cf_class"),
-      canopus_superclass = pick(row, "canopus_cf_superclass"),
-      hmdb_id = pick(row, "HMDB.ID"),
-      kegg_id = pick(row, "KEGG.ID"),
-      mz = if (!is.null(row$mz)) round(as.numeric(row$mz), 6) else NA,
-      rt = if (!is.null(row$rt)) round(as.numeric(row$rt), 2) else NA,
-      database_source = pick(row, "database_source"),
-      match_type = pick(row, "match_type"),
-      confidence_level = pick(row, "confidence_level")
-    )
-  }
-
+  metabolites <- lapply(seq_len(nrow(feat)), function(i) metabolite_record(feat[i, , drop = FALSE]))
+  ident <- feat$identified_name[grepl("Level [12]", feat$confidence_level)]
   list(
     metabolites = metabolites,
     n_metabolites = length(metabolites),
-    n_unique_compounds = length(unique(
-      sapply(metabolites, function(m) m$compound_name)
-    ))
+    n_identified = length(ident),
+    n_unique_compounds = length(unique(stats::na.omit(ident)))
+  )
+}
+
+#' Build the features.json payload — one record per feature, unknowns included
+#'
+#' Same record format as metabolites.json. This is the feature list
+#' cross-batch integration aligns (and the downstream modules re-align): it must
+#' hold every feature, not only the annotated ones.
+#'
+#' @param app3 Candidate table from finalize_annotation() (may be NULL)
+#' @param object2 mass_dataset
+build_features_json <- function(app3, object2) {
+  vi <- object2@variable_info
+  keep <- intersect(c("variable_id", "mz", "mz_raw", "rt"), colnames(vi))
+  feat <- vi[, intersect(c(keep, "isotope_of", "split_members"), colnames(vi)), drop = FALSE]
+  if (!is.null(app3) && nrow(app3) > 0) {
+    ann <- feature_level_rows(app3)
+    # variable_info is authoritative for m/z, RT and the isotope flag
+    ann <- ann[, setdiff(colnames(ann), c("mz", "mz_raw", "rt", "isotope_of", "split_members")), drop = FALSE]
+    feat <- merge(feat, ann, by = "variable_id", all.x = TRUE, sort = FALSE)
+  }
+  if ("isotope_of" %in% colnames(feat)) {
+    if (!"display_name" %in% colnames(feat)) feat$display_name <- NA_character_
+    iso <- is.na(feat$display_name) & !is.na(feat$isotope_of)
+    feat$display_name[iso] <- paste0(feat$variable_id[iso], " [13C of ", feat$isotope_of[iso], "]")
+  }
+  features <- lapply(seq_len(nrow(feat)), function(i) {
+    rec <- metabolite_record(feat[i, , drop = FALSE])
+    rec$isotope_of <- if ("isotope_of" %in% colnames(feat) && !is.na(feat$isotope_of[i])) feat$isotope_of[i] else NA
+    # "M886T68_NEG;M886T97_NEG": the second elution wave summed in (merge_split_peaks)
+    rec$split_members <- if ("split_members" %in% colnames(feat) && !is.na(feat$split_members[i])) feat$split_members[i] else NA
+    rec
+  })
+  levels <- vapply(features, function(f) f$msi_level, character(1))
+  list(
+    features = features,
+    n_features = length(features),
+    n_by_level = as.list(table(levels))
   )
 }
 
@@ -610,15 +697,12 @@ build_expression_json <- function(cmp_name, dr, object2, app3) {
   # Sample info
   samples <- colnames(sig_expr)
 
-  # Metabolite names (from annotation)
+  # Row labels: display names (identified name, "<candidate>? (<id>)" for
+  # accurate-mass-only features, else the feature ID)
   name_map <- list()
-  if (!is.null(app3) && nrow(app3) > 0) {
-    for (i in seq_len(nrow(app3))) {
-      vid <- as.character(app3$variable_id[i])
-      if (vid %in% names(name_map)) next
-      cname <- if (!is.null(app3$Compound.name[i]) && !is.na(app3$Compound.name[i]) && app3$Compound.name[i] != "") app3$Compound.name[i] else vid
-      name_map[[vid]] <- cname
-    }
+  feat <- feature_level_rows(app3)
+  for (i in seq_len(nrow(feat))) {
+    name_map[[as.character(feat$variable_id[i])]] <- feat$display_name[i]
   }
 
   # Build metabolite list
@@ -764,6 +848,7 @@ build_biomarker_json <- function(biomarker_results, cmp_name) {
     for (i in seq_len(nrow(fi))) {
       features[[i]] <- list(
         variable_id = rownames(fi)[i] %||% as.character(fi$variable_id[i] %||% i),
+        display_name = as.character(fi$display_name[i] %||% NA),
         importance = round(as.numeric(fi$importance[i] %||% fi$MeanDecreaseAccuracy[i] %||% 0), 4)
       )
     }
@@ -891,12 +976,16 @@ build_summary_json <- function(diff_results, app3) {
     n_up <- dr$n_up %||% 0
     n_down <- dr$n_down %||% 0
 
-    # Count how many significant metabolites have annotations
+    # Significant features that are identified (MSI Level 1-2) vs only
+    # putatively annotated (Level 3, accurate mass / compound class)
     n_annotated <- 0
+    n_putative <- 0
     if (!is.null(dr$sig) && nrow(dr$sig) > 0 && !is.null(app3) && nrow(app3) > 0) {
       sig_ids <- rownames(dr$sig)
-      ann_ids <- unique(app3$variable_id)
-      n_annotated <- sum(sig_ids %in% ann_ids)
+      feat <- feature_level_rows(app3)
+      lvl <- feat$confidence_level[match(sig_ids, feat$variable_id)]
+      n_annotated <- sum(grepl("Level [12]", lvl))
+      n_putative <- sum(grepl("Level 3", lvl))
     }
 
     comparisons[[cmp_name]] <- list(
@@ -907,6 +996,7 @@ build_summary_json <- function(diff_results, app3) {
       n_up = n_up,
       n_down = n_down,
       n_annotated = n_annotated,
+      n_putative = n_putative,
       n_ctrl_samples = length(dr$ctrl_samples %||% c()),
       n_treat_samples = length(dr$treat_samples %||% c())
     )
@@ -988,10 +1078,11 @@ export_all <- function(diff_results, app3, object2, cfg,
     cat("      This batch will be excluded from cross-batch integration.\n")
   }
 
-  # ── 2. Metabolites reference ────────────────────────────────────────────
-  cat("[2/7] Building metabolites.json...\n")
+  # ── 2. Metabolites reference + full feature list ───────────────────────
+  cat("[2/7] Building metabolites.json + features.json...\n")
   metabolites <- build_metabolites_json(app3, object2)
   write_json_export(metabolites, file.path(web_dir, "metabolites.json"))
+  write_json_export(build_features_json(app3, object2), file.path(web_dir, "features.json"))
 
   # ── 3. PCA scores ───────────────────────────────────────────────────────
   cat("[3/7] Building pca_scores.json...\n")

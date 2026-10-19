@@ -25,6 +25,25 @@ readj <- function(f) {
   tryCatch(fromJSON(f, simplifyVector = FALSE), error = function(e) NULL)
 }
 
+# Per-batch feature list for alignment. features.json (pipeline >= 2026-10-09)
+# holds every feature; metabolites.json only the annotated ones (it held ~96% of
+# features before the annotation fix, so older exports still align).
+read_batch_features <- function(web) {
+  f <- readj(file.path(web, "features.json"))
+  if (!is.null(f) && !is.null(f$features)) return(f$features)
+  m <- readj(file.path(web, "metabolites.json"))
+  if (is.null(m)) NULL else m$metabolites
+}
+
+# Member preference when one feature represents a group: identified (MSI
+# Level 1-2) < putative (Level 3, name shown as "<candidate>? (<id>)") < none.
+annotation_rank <- function(df) {
+  # compound_name is Level 1-2 only in features.json; pre-2026-10-09 exports
+  # have no msi_level and named every putative hit there.
+  ifelse(grepl("Level [12]", df$msi_level), 0L,
+         ifelse(grepl("Level 3", df$msi_level) | df$compound_name != "", 1L, 2L))
+}
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -184,11 +203,13 @@ features_of <- function(features, batch_id) {
   hmdb <- vapply(features, function(f) if (is.null(f$hmdb_id)) NA_character_ else as.character(f$hmdb_id), character(1))
   kegg <- vapply(features, function(f) if (is.null(f$kegg_id)) NA_character_ else as.character(f$kegg_id), character(1))
   formula <- vapply(features, function(f) if (is.null(f$formula)) "" else as.character(f$formula), character(1))
+  level <- vapply(features, function(f) if (is.null(f$msi_level)) "" else as.character(f$msi_level), character(1))
 
   df <- data.frame(
     batch_id = as.integer(batch_id),
     variable_id = id, mz = mz, rt = rt,
     compound_name = name, hmdb_id = hmdb, kegg_id = kegg, formula = formula,
+    msi_level = level,
     stringsAsFactors = FALSE
   )
   df <- df[!is.na(df$mz) & !is.na(df$rt), , drop = FALSE]
@@ -254,9 +275,9 @@ build_group_annotation <- function(cfg, verbose = TRUE) {
   feats_list <- list()
   for (bid in cfg$integration$batches) {
     web <- file.path(cfg$paths$results_dir, paste0("Batch", bid), "detail", "web_export")
-    m <- readj(file.path(web, "metabolites.json"))
-    if (is.null(m)) { logmsg("  WARNING: no metabolites.json for batch ", bid); next }
-    f <- features_of(m$metabolites, bid)
+    m <- read_batch_features(web)
+    if (is.null(m)) { logmsg("  WARNING: no features.json / metabolites.json for batch ", bid); next }
+    f <- features_of(m, bid)
     if (!is.null(f) && nrow(f) > 0) feats_list[[as.character(bid)]] <- f
     if (verbose) logmsg("  batch ", bid, ": ", if (is.null(f)) 0L else nrow(f), " features")
   }
@@ -264,7 +285,7 @@ build_group_annotation <- function(cfg, verbose = TRUE) {
   aligned <- align_features(combined, mz_ppm = cfg$integration$mz_ppm, rt_tol = cfg$integration$rt_tol)
 
   # best-annotated member per group (non-empty name preferred)
-  has_name <- ifelse(aligned$compound_name != "", 0L, 1L)
+  has_name <- annotation_rank(aligned)
   ord <- order(aligned$root_id, has_name, aligned$variable_id)
   grp <- aligned[ord, ]
   grp <- grp[!duplicated(grp$group_id), , drop = FALSE]
@@ -318,9 +339,9 @@ build_feature_key_map <- function(cfg) {
   feats_list <- list()
   for (bid in cfg$integration$batches) {
     web <- file.path(cfg$paths$results_dir, paste0("Batch", bid), "detail", "web_export")
-    m <- readj(file.path(web, "metabolites.json"))
+    m <- read_batch_features(web)
     if (is.null(m)) next
-    f <- features_of(m$metabolites, bid)
+    f <- features_of(m, bid)
     if (!is.null(f) && nrow(f) > 0) feats_list[[as.character(bid)]] <- f
   }
   combined <- do.call(rbind, feats_list)

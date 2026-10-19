@@ -3,10 +3,10 @@
 # identification report, so a change to build_metabolites_json() (or the report
 # that writes compound_source) can be applied without re-running the pipeline.
 #
-# The per-sheet `all_annotated_metabolites.csv` is written by run_annotation()
-# BEFORE SIRIUS/MetFrag run, so it carries no sirius_* columns. The Excel
-# "All_Identifications" sheet is written by generate_identification_report()
-# AFTER them, and is the table the web export is built from.
+# Reads the Excel "All_Identifications" sheet written by
+# generate_identification_report() — the same final candidate table (with
+# SIRIUS columns and feature-level MSI levels) as all_annotated_metabolites.csv.
+# features.json needs the mass_dataset and is only written by the pipeline.
 #
 # Usage: Rscript refresh_web_export.R <batch_output_dir>
 #   e.g. Rscript refresh_web_export.R /path/results/Batch5/detail
